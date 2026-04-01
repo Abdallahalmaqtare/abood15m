@@ -1,0 +1,31 @@
+# =====================================================
+# Aboud Trading Bot - Render Deployment Config
+# =====================================================
+
+services:
+  - type: web
+    name: aboud-trading-bot
+    runtime: python
+    region: frankfurt  # Closest to most forex brokers
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false  # Set manually in Render dashboard
+      - key: TELEGRAM_CHAT_ID
+        sync: false
+      - key: ADMIN_USER_IDS
+        sync: false
+      - key: WEBHOOK_SECRET
+        value: aboud_trading_secret_2024
+      - key: SIGNALS_ENABLED
+        value: "true"
+      - key: BOT_UTC_OFFSET
+        value: "0"
+      - key: DAILY_REPORT_HOUR
+        value: "21"
+      - key: PYTHON_VERSION
+        value: "3.11.0"
+      - key: PORT
+        value: "10000"
