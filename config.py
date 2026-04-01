@@ -52,8 +52,8 @@ ADX_MIN_THRESHOLD = 20
 # ============================================
 # TRADING HOURS (UTC)
 # ============================================
-TRADING_START_HOUR_UTC = 7   # 07:00 UTC
-TRADING_END_HOUR_UTC = 18    # 18:00 UTC
+TRADING_START_HOUR_UTC = 0   # 07:00 UTC
+TRADING_END_HOUR_UTC = 24    # 18:00 UTC
 
 # ============================================
 # DATABASE
