@@ -27,11 +27,15 @@ from config import (
     WEBHOOK_PORT,
     DAILY_REPORT_HOUR_UTC,
     DAILY_REPORT_MINUTE,
+    TRADING_START_HOUR_UTC,
+    TRADING_END_HOUR_UTC,
+    SIGNAL_CONFIRM_DELAY_SECONDS,
     DEBUG,
 )
 from database import init_db, get_daily_stats, get_today_trades, is_signals_enabled
 from signal_manager import SignalManager
 from telegram_sender import TelegramSender
+from price_service import price_service
 from admin_bot import setup_admin_handlers
 
 # ============================================
@@ -47,7 +51,7 @@ logger = logging.getLogger("AboudTrading")
 # ============================================
 # FLASK APP (Webhook Receiver)
 # ============================================
-flask_app = Flask(__name__)
+app = Flask(__name__)
 
 # Global references (set during startup)
 signal_manager = None
@@ -55,7 +59,7 @@ telegram_sender = None
 loop = None
 
 
-@flask_app.route("/", methods=["GET"])
+@app.route("/", methods=["GET"])
 def health():
     """Health check endpoint."""
     return jsonify({
@@ -66,7 +70,7 @@ def health():
     })
 
 
-@flask_app.route("/webhook", methods=["POST"])
+@app.route("/webhook", methods=["POST"])
 def webhook():
     """
     Receive TradingView webhook alerts.
@@ -132,7 +136,7 @@ def webhook():
         return jsonify({"error": str(e)}), 500
 
 
-@flask_app.route("/webhook/test", methods=["GET", "POST"])
+@app.route("/webhook/test", methods=["GET", "POST"])
 def webhook_test():
     """Test endpoint to verify webhook is working."""
     return jsonify({
@@ -204,8 +208,8 @@ async def run_bot():
     logger.info("=" * 50)
     logger.info(f"  Pairs: EURUSD, USDJPY, USDCHF")
     logger.info(f"  Timeframe: 15 minutes")
-    logger.info(f"  Trading hours: {config.TRADING_START_HOUR_UTC}:00 - {config.TRADING_END_HOUR_UTC}:00 UTC")
-    logger.info(f"  Signal confirm delay: {config.SIGNAL_CONFIRM_DELAY_SECONDS}s")
+    logger.info(f"  Trading hours: {TRADING_START_HOUR_UTC}:00 - {TRADING_END_HOUR_UTC}:00 UTC")
+    logger.info(f"  Signal confirm delay: {SIGNAL_CONFIRM_DELAY_SECONDS}s")
     logger.info(f"  Signals enabled: {is_signals_enabled()}")
     logger.info("=" * 50)
 
@@ -236,7 +240,7 @@ async def run_bot():
 
 def run_flask():
     """Run Flask in a separate thread."""
-    flask_app.run(
+    app.run(
         host="0.0.0.0",
         port=WEBHOOK_PORT,
         debug=False,
@@ -246,8 +250,6 @@ def run_flask():
 
 def main():
     """Main entry point."""
-    import config
-
     logger.info("Starting Aboud Trading Bot...")
 
     # Run Flask webhook server in a separate thread
