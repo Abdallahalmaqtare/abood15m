@@ -6,13 +6,13 @@ services:
   - type: web
     name: aboud-trading-bot
     runtime: python
-    region: frankfurt  # Closest to most forex brokers
+    region: frankfurt
     plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: python main.py
     envVars:
       - key: TELEGRAM_BOT_TOKEN
-        sync: false  # Set manually in Render dashboard
+        sync: false
       - key: TELEGRAM_CHAT_ID
         sync: false
       - key: ADMIN_USER_IDS
