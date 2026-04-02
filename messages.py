@@ -1,8 +1,10 @@
 """
-Aboud Trading Bot - Message Formatter
-=======================================
+Aboud Trading Bot - Message Formatter (FIXED)
+================================================
 Formats all Telegram messages to match the design style.
 Uses emojis and structured layout similar to the reference image.
+
+FIX: All times now displayed with UTC+3 label
 """
 
 from datetime import datetime, timezone
@@ -15,7 +17,7 @@ def format_signal_message(pair, direction, entry_time, stats):
     Args:
         pair: e.g. "EURUSD"
         direction: "CALL" or "PUT"
-        entry_time: e.g. "09:15"
+        entry_time: e.g. "09:15" (already in UTC+3)
         stats: dict with total_wins, total_losses
     """
     direction_emoji = "🟢" if direction == "CALL" else "🔴"
@@ -32,7 +34,7 @@ def format_signal_message(pair, direction, entry_time, stats):
         f"\n"
         f"📊 <b>{pair}</b>\n"
         f"{direction_emoji} <b>{direction_text}</b>\n"
-        f"🕐 <b>{entry_time}</b>\n"
+        f"🕐 <b>{entry_time} (UTC+3)</b>\n"
         f"⏳ <b>15 minutes</b>\n"
         f"\n"
     )
@@ -53,7 +55,7 @@ def format_result_message(pair, direction, entry_time, result):
     Args:
         pair: e.g. "EURUSD"
         direction: "CALL" or "PUT"
-        entry_time: e.g. "09:15"
+        entry_time: e.g. "09:15" (already in UTC+3)
         result: "WIN" or "LOSS"
     """
     if result == "WIN":
@@ -62,7 +64,7 @@ def format_result_message(pair, direction, entry_time, result):
         msg = (
             f"<b>Aboud Trading 15M POCKETOPTION BOT</b> 🔵\n"
             f"\n"
-            f"{result_emoji} → {pair} {entry_time} {arrow}\n"
+            f"{result_emoji} → {pair} {entry_time} (UTC+3) {arrow}\n"
             f"\n"
             f"<b>🏆 WIN!</b>\n"
         )
@@ -72,7 +74,7 @@ def format_result_message(pair, direction, entry_time, result):
         msg = (
             f"<b>Aboud Trading 15M POCKETOPTION BOT</b> 🔵\n"
             f"\n"
-            f"{result_emoji} → {pair} {entry_time} {arrow}\n"
+            f"{result_emoji} → {pair} {entry_time} (UTC+3) {arrow}\n"
             f"\n"
             f"<b>💔 LOSS</b>\n"
         )
@@ -112,26 +114,32 @@ def format_stats_message(stats_list):
         w = s.get("total_wins", 0)
         l = s.get("total_losses", 0)
         t = w + l
-        rate = round((w / t) * 100) if t > 0 else 0
-        msg += (
-            f"  📊 <b>{pair}</b>\n"
-            f"     ✅ {w} | ❌ {l} | 🎯 {rate}%\n"
-            f"\n"
-        )
+        r = round((w / t) * 100) if t > 0 else 0
+        msg += f"  📊 <b>{pair}</b>: ✅ {w} | ❌ {l} | 🎯 {r}%\n"
+
+    msg += (
+        f"\n"
+        f"{'━' * 30}\n"
+        f"<i>🤖 Aboud Trading Bot v1.0</i>\n"
+    )
 
     return msg
 
 
-def format_daily_report(daily_stats, today_trades=None):
+def format_daily_report(daily_stats, today_trades):
     """
-    Format daily report message.
+    Format the daily report message.
 
     Args:
-        daily_stats: list of dicts with daily pair stats
-        today_trades: list of today's trades (optional)
+        daily_stats: list of dicts with pair daily stats
+        today_trades: list of trade dicts for today
     """
-    now = datetime.now(timezone.utc)
-    date_str = now.strftime("%Y-%m-%d")
+    from datetime import datetime, timezone, timedelta
+    from config import BOT_TIMEZONE
+
+    # Use UTC+3 for date display
+    now_local = datetime.now(BOT_TIMEZONE)
+    date_str = now_local.strftime("%Y-%m-%d")
 
     total_d_wins = sum(s.get("daily_wins", 0) for s in daily_stats)
     total_d_losses = sum(s.get("daily_losses", 0) for s in daily_stats)
@@ -234,6 +242,7 @@ def format_status_message(signals_enabled, pending_count, today_count):
         f"Today's Trades: <b>{today_count}</b>\n"
         f"Pairs: EURUSD, USDJPY, USDCHF\n"
         f"Timeframe: 15 Minutes\n"
+        f"Timezone: UTC+3\n"
         f"\n"
         f"<i>🤖 Aboud Trading Bot v1.0</i>\n"
     )
