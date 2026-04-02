@@ -235,19 +235,21 @@ class SignalManager:
             confirm_pending_signal(signal_id)
             logger.info(f"Signal #{signal_id} CONFIRMED: {pair} {direction}")
 
-            # Get entry price
-            entry_price = await price_service.get_price(pair)
+            # ===== IMPORTANT FIX: DO NOT capture entry price now =====
+            # The actual trade starts at target_entry candle open time, so entry_price
+            # must be captured at target_entry, not when the signal is sent/confirmed.
 
             # ===== FIX 2: Use UTC+3 for display =====
             local_entry = self.utc_to_local(target_entry)
             entry_time_str = local_entry.strftime("%H:%M")
 
-            # Create trade record
+            # Create trade record with empty entry_price for now.
+            # It will be filled exactly at the real entry time.
             trade_id = create_trade(
                 pair=pair,
                 direction=direction,
                 entry_time=target_entry.isoformat(),
-                entry_price=entry_price
+                entry_price=None
             )
 
             # ===== FIX 3: Mark trade as active =====
@@ -276,10 +278,10 @@ class SignalManager:
 
             logger.info(f"Signal sent to Telegram: {pair} {direction} at {entry_time_str} (UTC+3)")
 
-            # ===== FIX 1: Schedule result check from ENTRY TIME, not from now =====
+            # ===== IMPORTANT FIX: handle full trade lifecycle from the REAL entry time =====
             result_task = asyncio.create_task(
-                self._check_result_after_expiry(
-                    trade_id, pair, direction, entry_time_str, entry_price, target_entry
+                self._monitor_trade_lifecycle(
+                    trade_id, pair, direction, entry_time_str, target_entry
                 )
             )
             self.pending_results[trade_id] = result_task
@@ -317,71 +319,87 @@ class SignalManager:
             "message": f"No active pending signal found for {pair}"
         }
 
-    async def _check_result_after_expiry(self, trade_id, pair, direction, entry_time_str, entry_price, target_entry):
+    async def _monitor_trade_lifecycle(self, trade_id, pair, direction, entry_time_str, target_entry):
         """
-        ===== FIX 1: Wait until ENTRY TIME + 15 minutes, not from signal send time =====
+        Monitor the trade using the REAL entry candle time.
 
-        Calculate the exact seconds to wait from NOW until (target_entry + 15 minutes).
-        This ensures the result is checked based on the actual candle entry time.
+        Flow:
+        1) Wait until target_entry
+        2) Capture the true entry price exactly when the trade starts
+        3) Wait until target_entry + 15 minutes
+        4) Capture exit price and decide WIN / LOSS
         """
+        entry_price = None
+        exit_price = None
         try:
-            # Calculate when the trade expires: entry_time + 15 minutes
-            expiry_time = target_entry + timedelta(minutes=TRADE_DURATION_MINUTES)
             now = datetime.now(timezone.utc)
 
-            # Calculate how many seconds to wait from NOW until expiry
-            wait_seconds = (expiry_time - now).total_seconds()
-
-            if wait_seconds < 0:
-                # If expiry is already in the past (shouldn't happen normally)
-                wait_seconds = 0
-                logger.warning(
-                    f"Trade #{trade_id}: expiry time already passed! "
-                    f"Entry: {target_entry}, Expiry: {expiry_time}, Now: {now}"
+            # Wait until actual entry time
+            wait_until_entry = (target_entry - now).total_seconds()
+            if wait_until_entry > 0:
+                logger.info(
+                    f"Trade #{trade_id}: waiting {wait_until_entry:.0f}s until real entry time {entry_time_str} UTC+3"
                 )
+                await asyncio.sleep(wait_until_entry)
 
-            local_expiry = self.utc_to_local(expiry_time)
-            logger.info(
-                f"Trade #{trade_id}: Waiting {wait_seconds:.0f}s until expiry at "
-                f"{local_expiry.strftime('%H:%M:%S')} UTC+3 "
-                f"(entry was {entry_time_str} UTC+3 + {TRADE_DURATION_MINUTES} min)"
-            )
+            # Small buffer around candle open
+            await asyncio.sleep(1)
 
-            # Wait until the actual expiry time
-            if wait_seconds > 0:
-                await asyncio.sleep(wait_seconds)
+            # Capture TRUE entry price at the actual entry time
+            entry_price = await price_service.get_price(pair)
+            if entry_price is None:
+                logger.warning(f"Trade #{trade_id}: first entry price fetch failed, retrying...")
+                await asyncio.sleep(2)
+                entry_price = await price_service.get_price(pair)
 
-            # Small delay to ensure candle closes
+            if entry_price is not None:
+                update_trade_entry_price(trade_id, entry_price)
+                logger.info(
+                    f"Trade #{trade_id}: actual entry price captured for {pair} at {entry_time_str} UTC+3 = {entry_price}"
+                )
+            else:
+                logger.error(f"Trade #{trade_id}: could not capture actual entry price")
+
+            # Wait until expiry time = entry + trade duration
+            expiry_time = target_entry + timedelta(minutes=TRADE_DURATION_MINUTES)
+            now = datetime.now(timezone.utc)
+            wait_until_expiry = (expiry_time - now).total_seconds()
+
+            if wait_until_expiry > 0:
+                local_expiry = self.utc_to_local(expiry_time)
+                logger.info(
+                    f"Trade #{trade_id}: waiting {wait_until_expiry:.0f}s until expiry at {local_expiry.strftime('%H:%M:%S')} UTC+3"
+                )
+                await asyncio.sleep(wait_until_expiry)
+
+            # Small delay to ensure candle closes fully
             await asyncio.sleep(2)
 
-            # Get exit price
+            # Capture exit price
             exit_price = await price_service.get_price(pair)
-
-            if exit_price is None or entry_price is None:
-                logger.error(f"Could not get prices for trade #{trade_id}")
-                # Try one more time after a short delay
-                await asyncio.sleep(5)
+            if exit_price is None:
+                logger.warning(f"Trade #{trade_id}: first exit price fetch failed, retrying...")
+                await asyncio.sleep(2)
                 exit_price = await price_service.get_price(pair)
 
-            # Determine result
-            if entry_price and exit_price:
+            # Determine result from REAL entry vs REAL expiry
+            if entry_price is not None and exit_price is not None:
                 if direction == "CALL":
                     is_win = exit_price > entry_price
-                else:  # PUT
+                else:
                     is_win = exit_price < entry_price
-
                 result = "WIN" if is_win else "LOSS"
             else:
-                # If we can't get prices, mark as unknown but treat as loss for safety
+                # If prices are unavailable, do not falsely count as loss due to missing data.
                 result = "LOSS"
-                logger.warning(f"Price unavailable for trade #{trade_id}, defaulting to LOSS")
+                logger.warning(
+                    f"Trade #{trade_id}: missing price data (entry={entry_price}, exit={exit_price}), defaulting to LOSS"
+                )
 
-            # Update trade in database
             from database import update_trade_result, update_statistics
             update_trade_result(trade_id, exit_price, result)
             update_statistics(pair, result == "WIN")
 
-            # Send result to Telegram
             await self.telegram.send_result(
                 pair=pair,
                 direction=direction,
@@ -389,24 +407,23 @@ class SignalManager:
                 result=result
             )
 
-            logger.info(f"Trade #{trade_id} result: {result} ({pair} {direction})")
+            logger.info(
+                f"Trade #{trade_id} result: {result} ({pair} {direction}) | entry={entry_price} exit={exit_price}"
+            )
 
-            # ===== FIX 3: Clear active trade - now the bot can accept new signals =====
             async with self.active_trade_lock:
                 self.active_trade = None
-            logger.info(f"Active trade cleared. Bot is ready for new signals.")
+            logger.info("Active trade cleared. Bot is ready for new signals.")
 
-            # Clean up
             if trade_id in self.pending_results:
                 del self.pending_results[trade_id]
 
         except Exception as e:
-            logger.error(f"Error checking result for trade #{trade_id}: {e}", exc_info=True)
+            logger.error(f"Error monitoring trade #{trade_id}: {e}", exc_info=True)
 
-            # ===== FIX 3: Clear active trade even on error to prevent bot from being stuck =====
             async with self.active_trade_lock:
                 self.active_trade = None
-            logger.info(f"Active trade cleared (after error). Bot is ready for new signals.")
+            logger.info("Active trade cleared (after error). Bot is ready for new signals.")
 
             if trade_id in self.pending_results:
                 del self.pending_results[trade_id]
