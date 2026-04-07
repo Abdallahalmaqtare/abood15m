@@ -1,27 +1,21 @@
 """
-Aboud Trading Bot - Signal Manager (FIXED)
-=============================================
-Handles the core signal logic:
-1. Receives temporary signals from TradingView webhook
-2. Waits 2 minutes for confirmation
-3. Re-validates conditions
-4. Sends confirmed signals to Telegram
-5. Schedules result checking after 15 minutes FROM ENTRY TIME (not from signal send time)
-
-FIXES APPLIED:
-- FIX 1: Result is now checked 15 minutes from ENTRY TIME, not from signal send time
-- FIX 2: All times displayed in UTC+3 timezone
-- FIX 3: Only ONE trade at a time - bot stops sending signals until current trade finishes
-- FIX 4: No duplicate signals for the same pair
+Aboud Trading Bot - Signal Manager v3
+========================================
+CHANGES:
+- Confirmation window: 2-10 minutes (checks every 30s)
+- One trade at a time
+- Result from entry time + 15 min
+- All times UTC+3
+- No random resets
 """
-
 import asyncio
 import logging
-import json
 from datetime import datetime, timezone, timedelta
 
 from config import (
-    SIGNAL_CONFIRM_DELAY_SECONDS,
+    SIGNAL_CONFIRM_MIN_SECONDS,
+    SIGNAL_CONFIRM_MAX_SECONDS,
+    SIGNAL_CONFIRM_CHECK_INTERVAL,
     TRADE_DURATION_MINUTES,
     TRADING_PAIRS,
     TRADING_START_HOUR_UTC,
@@ -29,13 +23,9 @@ from config import (
     BOT_TIMEZONE,
 )
 from database import (
-    create_pending_signal,
-    confirm_pending_signal,
-    cancel_pending_signal,
-    create_trade,
-    update_trade_entry_price,
-    is_signals_enabled,
-    get_pair_statistics,
+    create_pending_signal, confirm_pending_signal, cancel_pending_signal,
+    create_trade, update_trade_entry_price, update_trade_result,
+    update_statistics, is_signals_enabled, get_pair_statistics,
 )
 from price_service import price_service
 
@@ -43,216 +33,168 @@ logger = logging.getLogger(__name__)
 
 
 class SignalManager:
-    """Manages the complete signal lifecycle."""
-
     def __init__(self, telegram_sender):
         self.telegram = telegram_sender
-        self.active_pending = {}  # {pair: asyncio.Task}
-        self.pending_results = {}  # {trade_id: asyncio.Task}
-
-        # ===== FIX 3: Track active trade =====
-        # Only ONE trade can be active at a time.
-        # When a trade is confirmed and waiting for result, no new signals are sent.
-        self.active_trade = None  # Will hold info dict when a trade is active
+        self.active_pending = {}
+        self.pending_results = {}
+        self.active_trade = None
         self.active_trade_lock = asyncio.Lock()
+        # Track last webhook per pair to detect if signal is still active
+        self._last_signal = {}  # {pair: {"direction": str, "time": datetime}}
 
     def is_trading_hours(self):
-        """Check if current time is within trading hours."""
+        if TRADING_START_HOUR_UTC == 0 and TRADING_END_HOUR_UTC == 24:
+            return True
         now = datetime.now(timezone.utc)
         return TRADING_START_HOUR_UTC <= now.hour < TRADING_END_HOUR_UTC
 
     def is_valid_pair(self, pair):
-        """Check if the pair is in our trading list."""
         return pair.upper().replace("/", "") in TRADING_PAIRS
 
     def get_next_candle_time(self):
-        """Calculate the next 15-minute candle opening time."""
         now = datetime.now(timezone.utc)
-        minutes = now.minute
-        # Next 15-min candle: 0, 15, 30, 45
-        next_slot = ((minutes // 15) + 1) * 15
-        if next_slot >= 60:
-            next_candle = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
-        else:
-            next_candle = now.replace(minute=next_slot, second=0, microsecond=0)
-        return next_candle
+        m = now.minute
+        ns = ((m // 15) + 1) * 15
+        if ns >= 60:
+            return now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+        return now.replace(minute=ns, second=0, microsecond=0)
 
-    def utc_to_local(self, utc_dt):
-        """
-        ===== FIX 2: Convert UTC time to BOT_TIMEZONE (UTC+3) =====
-        """
-        return utc_dt.astimezone(BOT_TIMEZONE)
+    def utc_to_local(self, dt):
+        return dt.astimezone(BOT_TIMEZONE)
 
     def has_active_trade(self):
-        """
-        ===== FIX 3: Check if there's an active trade =====
-        Returns True if a trade is currently running (waiting for result).
-        """
         return self.active_trade is not None
 
     async def process_webhook_signal(self, data):
-        """
-        Process incoming webhook signal from TradingView.
-
-        Expected data format:
-        {
-            "pair": "EURUSD",
-            "direction": "CALL" or "PUT",
-            "action": "SIGNAL" or "CANCEL",
-            "indicators": {
-                "ema_fast": 1.0850,
-                "ema_slow": 1.0830,
-                "rsi": 55.2,
-                "supertrend": "UP",
-                "adx": 25.3
-            }
-        }
-        """
         pair = data.get("pair", "").upper().replace("/", "")
         direction = data.get("direction", "").upper()
         action = data.get("action", "SIGNAL").upper()
         indicators = data.get("indicators", {})
 
-        logger.info(f"Received webhook: {pair} {direction} {action}")
+        logger.info(f"Webhook: {pair} {direction} {action}")
 
-        # Validations
         if not is_signals_enabled():
-            logger.info("Signals are disabled. Ignoring.")
-            return {"status": "disabled", "message": "Signals are currently disabled"}
+            return {"status": "disabled"}
 
         if not self.is_valid_pair(pair):
-            logger.warning(f"Invalid pair: {pair}")
             return {"status": "error", "message": f"Invalid pair: {pair}"}
 
         if direction not in ["CALL", "PUT"]:
-            logger.warning(f"Invalid direction: {direction}")
             return {"status": "error", "message": f"Invalid direction: {direction}"}
 
         if not self.is_trading_hours():
-            logger.info("Outside trading hours. Ignoring signal.")
             return {"status": "skipped", "message": "Outside trading hours"}
 
-        # Handle CANCEL action (signal reversed before confirmation)
+        # Update last signal tracker
+        if action == "SIGNAL":
+            self._last_signal[pair] = {
+                "direction": direction,
+                "time": datetime.now(timezone.utc),
+            }
+
         if action == "CANCEL":
+            # Remove from tracker
+            self._last_signal.pop(pair, None)
             return await self._cancel_active_pending(pair, direction)
 
-        # ===== FIX 3: Check if there's already an active trade =====
+        # Block if active trade exists
         if self.has_active_trade():
-            active = self.active_trade
-            logger.info(
-                f"BLOCKED: Signal for {pair} {direction} rejected - "
-                f"active trade exists: {active['pair']} {active['direction']} "
-                f"(entry: {active['entry_time']})"
-            )
-            return {
-                "status": "blocked",
-                "message": (
-                    f"Signal blocked: active trade in progress "
-                    f"({active['pair']} {active['direction']} entry at {active['entry_time']}). "
-                    f"Waiting for current trade to finish."
-                )
-            }
+            return {"status": "blocked", "message": "Active trade in progress"}
 
-        # ===== FIX 4: Check if there's already a pending signal for this pair =====
+        # Block duplicate pending
         if pair in self.active_pending and not self.active_pending[pair].done():
-            logger.info(f"BLOCKED: Duplicate signal for {pair} - pending signal already exists")
-            return {
-                "status": "duplicate",
-                "message": f"Signal blocked: pending signal already exists for {pair}"
-            }
+            return {"status": "duplicate", "message": f"Pending signal exists for {pair}"}
 
-        # Create temporary signal
         return await self._create_temporary_signal(pair, direction, indicators)
 
     async def _create_temporary_signal(self, pair, direction, indicators):
-        """Create a temporary signal and start the 2-minute timer."""
         now = datetime.now(timezone.utc)
         next_candle = self.get_next_candle_time()
 
-        # Create pending signal in DB
         signal_id = create_pending_signal(
-            pair=pair,
-            direction=direction,
+            pair=pair, direction=direction,
             detected_at=now.isoformat(),
             target_entry_time=next_candle.isoformat(),
             indicator_data=indicators
         )
 
-        # ===== FIX 2: Display time in UTC+3 =====
         local_entry = self.utc_to_local(next_candle)
-        logger.info(
-            f"Created pending signal #{signal_id}: {pair} {direction} "
-            f"(target entry: {local_entry.strftime('%H:%M')} UTC+3)"
-        )
+        logger.info(f"Pending #{signal_id}: {pair} {direction} (entry: {local_entry.strftime('%H:%M')} UTC+3)")
 
-        # Cancel any existing pending signal for the same pair
         if pair in self.active_pending:
-            old_task = self.active_pending[pair]
-            if not old_task.done():
-                old_task.cancel()
-                logger.info(f"Cancelled previous pending signal for {pair}")
+            old = self.active_pending[pair]
+            if not old.done():
+                old.cancel()
 
-        # Start confirmation timer
         task = asyncio.create_task(
-            self._confirmation_timer(signal_id, pair, direction, next_candle, indicators)
+            self._smart_confirmation(signal_id, pair, direction, next_candle, indicators)
         )
         self.active_pending[pair] = task
 
-        return {
-            "status": "pending",
-            "signal_id": signal_id,
-            "message": f"Signal pending for {pair} {direction}. Confirming in {SIGNAL_CONFIRM_DELAY_SECONDS}s..."
-        }
+        return {"status": "pending", "signal_id": signal_id}
 
-    async def _confirmation_timer(self, signal_id, pair, direction, target_entry, indicators):
+    async def _smart_confirmation(self, signal_id, pair, direction, target_entry, indicators):
         """
-        Wait for SIGNAL_CONFIRM_DELAY_SECONDS (2 minutes).
-        If not cancelled by then, confirm and send the signal.
+        Smart confirmation: wait 2-10 minutes.
+        Every 30 seconds, check if the signal is still valid.
+        Send as soon as confirmed after minimum 2 minutes.
+        Cancel if signal disappears before confirmation.
         """
         try:
-            logger.info(f"Starting {SIGNAL_CONFIRM_DELAY_SECONDS}s confirmation timer for signal #{signal_id}")
+            elapsed = 0
+            confirmed = False
 
-            # Wait 2 minutes
-            await asyncio.sleep(SIGNAL_CONFIRM_DELAY_SECONDS)
+            while elapsed < SIGNAL_CONFIRM_MAX_SECONDS:
+                await asyncio.sleep(SIGNAL_CONFIRM_CHECK_INTERVAL)
+                elapsed += SIGNAL_CONFIRM_CHECK_INTERVAL
 
-            # Double-check signals are still enabled
-            if not is_signals_enabled():
+                # Check if cancelled externally
+                if not is_signals_enabled():
+                    cancel_pending_signal(signal_id)
+                    logger.info(f"#{signal_id} cancelled - signals disabled")
+                    return
+
+                if self.has_active_trade():
+                    cancel_pending_signal(signal_id)
+                    logger.info(f"#{signal_id} cancelled - active trade appeared")
+                    if pair in self.active_pending:
+                        del self.active_pending[pair]
+                    return
+
+                # Check if signal still exists (not cancelled by CANCEL webhook)
+                last = self._last_signal.get(pair)
+                if not last or last["direction"] != direction:
+                    cancel_pending_signal(signal_id)
+                    logger.info(f"#{signal_id} cancelled - signal disappeared for {pair}")
+                    if pair in self.active_pending:
+                        del self.active_pending[pair]
+                    return
+
+                # After minimum time, confirm
+                if elapsed >= SIGNAL_CONFIRM_MIN_SECONDS:
+                    confirmed = True
+                    break
+
+            if not confirmed:
                 cancel_pending_signal(signal_id)
-                logger.info(f"Signal #{signal_id} cancelled - signals disabled")
-                return
-
-            # ===== FIX 3: Double-check no active trade before confirming =====
-            if self.has_active_trade():
-                cancel_pending_signal(signal_id)
-                logger.info(
-                    f"Signal #{signal_id} cancelled - active trade exists when trying to confirm"
-                )
+                logger.info(f"#{signal_id} timed out after {elapsed}s")
                 if pair in self.active_pending:
                     del self.active_pending[pair]
                 return
 
-            # Confirm the signal!
+            # === CONFIRMED ===
             confirm_pending_signal(signal_id)
-            logger.info(f"Signal #{signal_id} CONFIRMED: {pair} {direction}")
+            logger.info(f"#{signal_id} CONFIRMED after {elapsed}s: {pair} {direction}")
 
-            # ===== IMPORTANT FIX: DO NOT capture entry price now =====
-            # The actual trade starts at target_entry candle open time, so entry_price
-            # must be captured at target_entry, not when the signal is sent/confirmed.
-
-            # ===== FIX 2: Use UTC+3 for display =====
             local_entry = self.utc_to_local(target_entry)
             entry_time_str = local_entry.strftime("%H:%M")
 
-            # Create trade record with empty entry_price for now.
-            # It will be filled exactly at the real entry time.
             trade_id = create_trade(
-                pair=pair,
-                direction=direction,
+                pair=pair, direction=direction,
                 entry_time=target_entry.isoformat(),
                 entry_price=None
             )
 
-            # ===== FIX 3: Mark trade as active =====
             async with self.active_trade_lock:
                 self.active_trade = {
                     "trade_id": trade_id,
@@ -261,169 +203,115 @@ class SignalManager:
                     "entry_time": entry_time_str,
                     "target_entry_utc": target_entry,
                 }
-            logger.info(f"Active trade set: {pair} {direction} (trade #{trade_id})")
 
-            # Get statistics for this pair
-            stats = get_pair_statistics(pair) or {
-                "total_wins": 0, "total_losses": 0
-            }
+            stats = get_pair_statistics(pair) or {"total_wins": 0, "total_losses": 0}
 
-            # Send signal to Telegram
             await self.telegram.send_signal(
-                pair=pair,
-                direction=direction,
-                entry_time=entry_time_str,
-                stats=stats
+                pair=pair, direction=direction,
+                entry_time=entry_time_str, stats=stats
             )
 
-            logger.info(f"Signal sent to Telegram: {pair} {direction} at {entry_time_str} (UTC+3)")
+            logger.info(f"Signal sent: {pair} {direction} at {entry_time_str}")
 
-            # ===== IMPORTANT FIX: handle full trade lifecycle from the REAL entry time =====
+            # Monitor trade lifecycle
             result_task = asyncio.create_task(
-                self._monitor_trade_lifecycle(
-                    trade_id, pair, direction, entry_time_str, target_entry
-                )
+                self._monitor_trade(trade_id, pair, direction, entry_time_str, target_entry)
             )
             self.pending_results[trade_id] = result_task
 
-            # Clean up pending
             if pair in self.active_pending:
                 del self.active_pending[pair]
+
+            # Clean signal tracker
+            self._last_signal.pop(pair, None)
 
         except asyncio.CancelledError:
             cancel_pending_signal(signal_id)
-            logger.info(f"Signal #{signal_id} CANCELLED (timer cancelled): {pair} {direction}")
+            logger.info(f"#{signal_id} CANCELLED externally")
             if pair in self.active_pending:
                 del self.active_pending[pair]
-
         except Exception as e:
-            logger.error(f"Error in confirmation timer for signal #{signal_id}: {e}", exc_info=True)
+            logger.error(f"Error in confirmation #{signal_id}: {e}", exc_info=True)
             cancel_pending_signal(signal_id)
             if pair in self.active_pending:
                 del self.active_pending[pair]
 
     async def _cancel_active_pending(self, pair, direction):
-        """Cancel an active pending signal for a pair."""
         if pair in self.active_pending:
             task = self.active_pending[pair]
             if not task.done():
                 task.cancel()
-                logger.info(f"Cancelled pending signal for {pair} {direction} via webhook CANCEL")
-                return {
-                    "status": "cancelled",
-                    "message": f"Pending signal for {pair} {direction} cancelled"
-                }
+                return {"status": "cancelled"}
+        return {"status": "no_pending"}
 
-        return {
-            "status": "no_pending",
-            "message": f"No active pending signal found for {pair}"
-        }
-
-    async def _monitor_trade_lifecycle(self, trade_id, pair, direction, entry_time_str, target_entry):
-        """
-        Monitor the trade using the REAL entry candle time.
-
-        Flow:
-        1) Wait until target_entry
-        2) Capture the true entry price exactly when the trade starts
-        3) Wait until target_entry + 15 minutes
-        4) Capture exit price and decide WIN / LOSS
-        """
-        entry_price = None
-        exit_price = None
+    async def _monitor_trade(self, trade_id, pair, direction, entry_time_str, target_entry):
+        """Wait until entry, capture price, wait 15 min, check result."""
         try:
             now = datetime.now(timezone.utc)
 
-            # Wait until actual entry time
-            wait_until_entry = (target_entry - now).total_seconds()
-            if wait_until_entry > 0:
-                logger.info(
-                    f"Trade #{trade_id}: waiting {wait_until_entry:.0f}s until real entry time {entry_time_str} UTC+3"
-                )
-                await asyncio.sleep(wait_until_entry)
+            # Wait until entry
+            wait = (target_entry - now).total_seconds()
+            if wait > 0:
+                logger.info(f"Trade #{trade_id}: waiting {wait:.0f}s until entry")
+                await asyncio.sleep(wait)
 
-            # Small buffer around candle open
             await asyncio.sleep(1)
 
-            # Capture TRUE entry price at the actual entry time
+            # Capture entry price
             entry_price = await price_service.get_price(pair)
-            if entry_price is None:
-                logger.warning(f"Trade #{trade_id}: first entry price fetch failed, retrying...")
-                await asyncio.sleep(2)
+            if not entry_price:
+                await asyncio.sleep(3)
                 entry_price = await price_service.get_price(pair)
 
-            if entry_price is not None:
+            if entry_price:
                 update_trade_entry_price(trade_id, entry_price)
-                logger.info(
-                    f"Trade #{trade_id}: actual entry price captured for {pair} at {entry_time_str} UTC+3 = {entry_price}"
-                )
-            else:
-                logger.error(f"Trade #{trade_id}: could not capture actual entry price")
+                logger.info(f"Trade #{trade_id}: entry price = {entry_price}")
 
-            # Wait until expiry time = entry + trade duration
-            expiry_time = target_entry + timedelta(minutes=TRADE_DURATION_MINUTES)
+            # Wait until expiry
+            expiry = target_entry + timedelta(minutes=TRADE_DURATION_MINUTES)
             now = datetime.now(timezone.utc)
-            wait_until_expiry = (expiry_time - now).total_seconds()
+            wait = (expiry - now).total_seconds()
+            if wait > 0:
+                logger.info(f"Trade #{trade_id}: waiting {wait:.0f}s until expiry")
+                await asyncio.sleep(wait)
 
-            if wait_until_expiry > 0:
-                local_expiry = self.utc_to_local(expiry_time)
-                logger.info(
-                    f"Trade #{trade_id}: waiting {wait_until_expiry:.0f}s until expiry at {local_expiry.strftime('%H:%M:%S')} UTC+3"
-                )
-                await asyncio.sleep(wait_until_expiry)
-
-            # Small delay to ensure candle closes fully
             await asyncio.sleep(2)
 
             # Capture exit price
             exit_price = await price_service.get_price(pair)
-            if exit_price is None:
-                logger.warning(f"Trade #{trade_id}: first exit price fetch failed, retrying...")
-                await asyncio.sleep(2)
+            if not exit_price:
+                await asyncio.sleep(3)
                 exit_price = await price_service.get_price(pair)
 
-            # Determine result from REAL entry vs REAL expiry
-            if entry_price is not None and exit_price is not None:
+            # Determine result
+            if entry_price and exit_price:
                 if direction == "CALL":
                     is_win = exit_price > entry_price
                 else:
                     is_win = exit_price < entry_price
                 result = "WIN" if is_win else "LOSS"
             else:
-                # If prices are unavailable, do not falsely count as loss due to missing data.
                 result = "LOSS"
-                logger.warning(
-                    f"Trade #{trade_id}: missing price data (entry={entry_price}, exit={exit_price}), defaulting to LOSS"
-                )
 
-            from database import update_trade_result, update_statistics
             update_trade_result(trade_id, exit_price, result)
             update_statistics(pair, result == "WIN")
 
             await self.telegram.send_result(
-                pair=pair,
-                direction=direction,
-                entry_time=entry_time_str,
-                result=result
+                pair=pair, direction=direction,
+                entry_time=entry_time_str, result=result
             )
 
-            logger.info(
-                f"Trade #{trade_id} result: {result} ({pair} {direction}) | entry={entry_price} exit={exit_price}"
-            )
+            logger.info(f"Trade #{trade_id}: {result} (entry={entry_price}, exit={exit_price})")
 
+            # Release lock
             async with self.active_trade_lock:
                 self.active_trade = None
-            logger.info("Active trade cleared. Bot is ready for new signals.")
+            logger.info("Trade completed. Ready for new signals.")
 
-            if trade_id in self.pending_results:
-                del self.pending_results[trade_id]
+            self.pending_results.pop(trade_id, None)
 
         except Exception as e:
-            logger.error(f"Error monitoring trade #{trade_id}: {e}", exc_info=True)
-
+            logger.error(f"Error in trade #{trade_id}: {e}", exc_info=True)
             async with self.active_trade_lock:
                 self.active_trade = None
-            logger.info("Active trade cleared (after error). Bot is ready for new signals.")
-
-            if trade_id in self.pending_results:
-                del self.pending_results[trade_id]
+            self.pending_results.pop(trade_id, None)
