@@ -1,14 +1,16 @@
 """
-Aboud Trading Bot - Main v3
-==============================
-FIX: No repeated startup messages.
-     Bot sends startup msg only ONCE, tracked in DB.
-     Stable all day.
+Aboud Trading Bot - Main v3.1
+FIXES:
+- Startup msg only once per 30min (FILE-based, not DB)
+- DB in persistent Render path
+- Graceful crash recovery
 """
 import asyncio
 import logging
 import threading
 import json
+import os
+import time
 from datetime import datetime, timezone
 
 from flask import Flask, request, jsonify
@@ -18,11 +20,10 @@ from telegram.ext import Application
 from config import (
     TELEGRAM_BOT_TOKEN, WEBHOOK_SECRET, WEBHOOK_PORT,
     DAILY_REPORT_HOUR_UTC, DAILY_REPORT_MINUTE,
-    TRADING_START_HOUR_UTC, TRADING_END_HOUR_UTC,
     SIGNAL_CONFIRM_MIN_SECONDS, SIGNAL_CONFIRM_MAX_SECONDS,
-    BOT_UTC_OFFSET, DEBUG,
+    BOT_UTC_OFFSET, DEBUG, STARTUP_FLAG_FILE, DATABASE_PATH,
 )
-from database import init_db, get_daily_stats, get_today_trades, is_signals_enabled, get_setting, set_setting
+from database import init_db, get_daily_stats, get_today_trades, is_signals_enabled
 from signal_manager import SignalManager
 from telegram_sender import TelegramSender
 from price_service import price_service
@@ -36,7 +37,6 @@ logging.basicConfig(
 logger = logging.getLogger("AboudTrading")
 
 app = Flask(__name__)
-
 signal_manager = None
 telegram_sender = None
 loop = None
@@ -46,9 +46,10 @@ loop = None
 def health():
     return jsonify({
         "status": "ok",
-        "bot": "Aboud Trading Bot v3.0",
-        "signals_enabled": is_signals_enabled(),
-        "timestamp": datetime.now(timezone.utc).isoformat()
+        "bot": "Aboud Trading Bot v3.1",
+        "signals": is_signals_enabled(),
+        "db": DATABASE_PATH,
+        "db_exists": os.path.exists(DATABASE_PATH),
     })
 
 
@@ -63,13 +64,10 @@ def webhook():
             except json.JSONDecodeError:
                 parts = raw.strip().split(",")
                 if len(parts) >= 2:
-                    data = {
-                        "pair": parts[0].strip(),
-                        "direction": parts[1].strip(),
-                        "action": parts[2].strip() if len(parts) > 2 else "SIGNAL",
-                    }
+                    data = {"pair": parts[0].strip(), "direction": parts[1].strip(),
+                            "action": parts[2].strip() if len(parts) > 2 else "SIGNAL"}
                 else:
-                    return jsonify({"error": "Invalid format"}), 400
+                    return jsonify({"error": "Bad format"}), 400
 
         secret = data.get("secret", "")
         if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
@@ -78,57 +76,58 @@ def webhook():
         logger.info(f"Webhook: {json.dumps(data, default=str)}")
 
         if signal_manager and loop:
-            future = asyncio.run_coroutine_threadsafe(
-                signal_manager.process_webhook_signal(data), loop
-            )
-            result = future.result(timeout=10)
-            return jsonify(result), 200
-        else:
-            return jsonify({"error": "Not initialized"}), 503
-
+            fut = asyncio.run_coroutine_threadsafe(signal_manager.process_webhook_signal(data), loop)
+            res = fut.result(timeout=10)
+            return jsonify(res), 200
+        return jsonify({"error": "Not init"}), 503
     except Exception as e:
-        logger.error(f"Webhook error: {e}", exc_info=True)
+        logger.error(f"Webhook err: {e}", exc_info=True)
         return jsonify({"error": str(e)}), 500
 
 
 @app.route("/webhook/test", methods=["GET", "POST"])
 def webhook_test():
-    return jsonify({"status": "ok", "message": "Webhook active"})
+    return jsonify({"status": "ok"})
+
+
+def _should_send_startup():
+    """FILE-based startup check. Only send if last was >30 min ago."""
+    try:
+        if os.path.exists(STARTUP_FLAG_FILE):
+            elapsed = time.time() - os.path.getmtime(STARTUP_FLAG_FILE)
+            if elapsed < 1800:
+                logger.info(f"Startup msg skipped ({elapsed:.0f}s ago)")
+                return False
+        with open(STARTUP_FLAG_FILE, "w") as f:
+            f.write(str(time.time()))
+        return True
+    except:
+        return True
 
 
 async def send_daily_report():
     try:
-        daily = get_daily_stats()
-        today = get_today_trades()
-        await telegram_sender.send_daily_report(daily, today)
-        logger.info("Daily report sent")
+        await telegram_sender.send_daily_report(get_daily_stats(), get_today_trades())
     except Exception as e:
-        logger.error(f"Daily report error: {e}", exc_info=True)
+        logger.error(f"Daily report err: {e}", exc_info=True)
 
 
 async def run_bot():
     global signal_manager, telegram_sender, loop
-
     loop = asyncio.get_event_loop()
 
     init_db()
-    logger.info("Database initialized")
+    logger.info(f"DB: {DATABASE_PATH} exists={os.path.exists(DATABASE_PATH)}")
 
     telegram_sender = TelegramSender()
     signal_manager = SignalManager(telegram_sender)
 
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-
-    # Store signal_manager in bot_data so admin_bot can access it
     application.bot_data["signal_manager"] = signal_manager
-
     setup_admin_handlers(application)
 
     scheduler = AsyncIOScheduler()
-    scheduler.add_job(
-        send_daily_report, "cron",
-        hour=DAILY_REPORT_HOUR_UTC, minute=DAILY_REPORT_MINUTE, timezone="UTC",
-    )
+    scheduler.add_job(send_daily_report, "cron", hour=DAILY_REPORT_HOUR_UTC, minute=DAILY_REPORT_MINUTE, timezone="UTC")
     scheduler.start()
 
     await application.initialize()
@@ -136,25 +135,18 @@ async def run_bot():
     await application.updater.start_polling(drop_pending_updates=True)
 
     logger.info("=" * 50)
-    logger.info("  Aboud Trading Bot v3.0 - STARTED")
-    logger.info(f"  Timezone: UTC+{BOT_UTC_OFFSET}")
-    logger.info(f"  Confirm window: {SIGNAL_CONFIRM_MIN_SECONDS}-{SIGNAL_CONFIRM_MAX_SECONDS}s")
+    logger.info("  Aboud Trading Bot v3.1 STARTED")
+    logger.info(f"  DB: {DATABASE_PATH}")
     logger.info("=" * 50)
 
-    # FIX: Only send startup message ONCE per deploy, not on every restart/ping
-    last_start = get_setting("last_startup_id", "")
-    import os
-    current_deploy = os.getenv("RENDER_GIT_COMMIT", "local")[:8]
-    if last_start != current_deploy:
-        set_setting("last_startup_id", current_deploy)
+    if _should_send_startup():
         await telegram_sender.send_text(
-            f"🟢 <b>Aboud Trading Bot v3.0 Started!</b>\n\n"
-            f"📊 Pairs: EURUSD, USDJPY, USDCHF\n"
-            f"⏱ Timeframe: 15 minutes\n"
-            f"🕐 Timezone: UTC+{BOT_UTC_OFFSET}\n"
-            f"⏳ Signal confirm: {SIGNAL_CONFIRM_MIN_SECONDS//60}-{SIGNAL_CONFIRM_MAX_SECONDS//60} min\n"
+            f"🟢 <b>Aboud Trading Bot v3.1</b>\n\n"
+            f"📊 EURUSD, USDJPY, USDCHF\n"
+            f"⏱ 15 min | 🕐 UTC+{BOT_UTC_OFFSET}\n"
+            f"⏳ Confirm: {SIGNAL_CONFIRM_MIN_SECONDS//60}-{SIGNAL_CONFIRM_MAX_SECONDS//60} min\n"
             f"🔒 One trade at a time\n"
-            f"🔄 Status: Active",
+            f"🔄 Active",
         )
 
     try:
@@ -176,10 +168,7 @@ def run_flask():
 
 
 def main():
-    logger.info("Starting Aboud Trading Bot v3.0...")
-    t = threading.Thread(target=run_flask, daemon=True)
-    t.start()
-    logger.info(f"Flask on port {WEBHOOK_PORT}")
+    threading.Thread(target=run_flask, daemon=True).start()
     asyncio.run(run_bot())
 
 
