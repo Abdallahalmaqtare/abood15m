@@ -1,16 +1,10 @@
 """
-Aboud Trading Bot - Main Application
-=======================================
-Entry point for the complete trading bot system.
-
-Components:
-1. Flask webhook server (receives TradingView alerts)
-2. Telegram bot (admin control panel)
-3. Signal manager (2-minute confirmation logic)
-4. Result checker (automatic Win/Loss after 15 min)
-5. Daily report scheduler
+Aboud Trading Bot - Main v3
+==============================
+FIX: No repeated startup messages.
+     Bot sends startup msg only ONCE, tracked in DB.
+     Stable all day.
 """
-
 import asyncio
 import logging
 import threading
@@ -22,25 +16,18 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from telegram.ext import Application
 
 from config import (
-    TELEGRAM_BOT_TOKEN,
-    WEBHOOK_SECRET,
-    WEBHOOK_PORT,
-    DAILY_REPORT_HOUR_UTC,
-    DAILY_REPORT_MINUTE,
-    TRADING_START_HOUR_UTC,
-    TRADING_END_HOUR_UTC,
-    SIGNAL_CONFIRM_DELAY_SECONDS,
-    DEBUG,
+    TELEGRAM_BOT_TOKEN, WEBHOOK_SECRET, WEBHOOK_PORT,
+    DAILY_REPORT_HOUR_UTC, DAILY_REPORT_MINUTE,
+    TRADING_START_HOUR_UTC, TRADING_END_HOUR_UTC,
+    SIGNAL_CONFIRM_MIN_SECONDS, SIGNAL_CONFIRM_MAX_SECONDS,
+    BOT_UTC_OFFSET, DEBUG,
 )
-from database import init_db, get_daily_stats, get_today_trades, is_signals_enabled
+from database import init_db, get_daily_stats, get_today_trades, is_signals_enabled, get_setting, set_setting
 from signal_manager import SignalManager
 from telegram_sender import TelegramSender
 from price_service import price_service
 from admin_bot import setup_admin_handlers
 
-# ============================================
-# LOGGING SETUP
-# ============================================
 logging.basicConfig(
     level=logging.DEBUG if DEBUG else logging.INFO,
     format="%(asctime)s | %(name)s | %(levelname)s | %(message)s",
@@ -48,12 +35,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger("AboudTrading")
 
-# ============================================
-# FLASK APP (Webhook Receiver)
-# ============================================
 app = Flask(__name__)
 
-# Global references (set during startup)
 signal_manager = None
 telegram_sender = None
 loop = None
@@ -61,10 +44,9 @@ loop = None
 
 @app.route("/", methods=["GET"])
 def health():
-    """Health check endpoint."""
     return jsonify({
         "status": "ok",
-        "bot": "Aboud Trading Bot v1.0",
+        "bot": "Aboud Trading Bot v3.0",
         "signals_enabled": is_signals_enabled(),
         "timestamp": datetime.now(timezone.utc).isoformat()
     })
@@ -72,36 +54,13 @@ def health():
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    """
-    Receive TradingView webhook alerts.
-
-    Expected JSON payload:
-    {
-        "secret": "your_webhook_secret",
-        "pair": "EURUSD",
-        "direction": "CALL",
-        "action": "SIGNAL",
-        "indicators": {
-            "ema_fast": 1.0850,
-            "ema_slow": 1.0830,
-            "rsi": 55.2,
-            "supertrend": "UP",
-            "adx": 25.3
-        }
-    }
-    """
     try:
-        # Try to parse JSON
         data = request.get_json(force=True, silent=True)
-
         if not data:
-            # Try plain text (TradingView sometimes sends as text)
             raw = request.get_data(as_text=True)
-            logger.info(f"Raw webhook data: {raw}")
             try:
                 data = json.loads(raw)
             except json.JSONDecodeError:
-                # Try to parse simple format: "EURUSD,CALL,SIGNAL"
                 parts = raw.strip().split(",")
                 if len(parts) >= 2:
                     data = {
@@ -110,26 +69,22 @@ def webhook():
                         "action": parts[2].strip() if len(parts) > 2 else "SIGNAL",
                     }
                 else:
-                    return jsonify({"error": "Invalid data format"}), 400
+                    return jsonify({"error": "Invalid format"}), 400
 
-        # Verify webhook secret (optional but recommended)
         secret = data.get("secret", "")
         if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
-            logger.warning(f"Invalid webhook secret received")
             return jsonify({"error": "Unauthorized"}), 401
 
-        logger.info(f"Webhook received: {json.dumps(data, default=str)}")
+        logger.info(f"Webhook: {json.dumps(data, default=str)}")
 
-        # Process the signal asynchronously
         if signal_manager and loop:
             future = asyncio.run_coroutine_threadsafe(
-                signal_manager.process_webhook_signal(data),
-                loop
+                signal_manager.process_webhook_signal(data), loop
             )
             result = future.result(timeout=10)
             return jsonify(result), 200
         else:
-            return jsonify({"error": "Bot not initialized"}), 503
+            return jsonify({"error": "Not initialized"}), 503
 
     except Exception as e:
         logger.error(f"Webhook error: {e}", exc_info=True)
@@ -138,97 +93,75 @@ def webhook():
 
 @app.route("/webhook/test", methods=["GET", "POST"])
 def webhook_test():
-    """Test endpoint to verify webhook is working."""
-    return jsonify({
-        "status": "ok",
-        "message": "Webhook endpoint is active",
-        "timestamp": datetime.now(timezone.utc).isoformat()
-    })
+    return jsonify({"status": "ok", "message": "Webhook active"})
 
 
-# ============================================
-# DAILY REPORT SCHEDULER
-# ============================================
 async def send_daily_report():
-    """Send the daily report at scheduled time."""
     try:
-        logger.info("Generating daily report...")
-        daily_stats = get_daily_stats()
-        today_trades = get_today_trades()
-        await telegram_sender.send_daily_report(daily_stats, today_trades)
-        logger.info("Daily report sent successfully")
+        daily = get_daily_stats()
+        today = get_today_trades()
+        await telegram_sender.send_daily_report(daily, today)
+        logger.info("Daily report sent")
     except Exception as e:
-        logger.error(f"Failed to send daily report: {e}", exc_info=True)
+        logger.error(f"Daily report error: {e}", exc_info=True)
 
 
-# ============================================
-# MAIN STARTUP
-# ============================================
 async def run_bot():
-    """Run the Telegram bot and scheduler."""
     global signal_manager, telegram_sender, loop
 
     loop = asyncio.get_event_loop()
 
-    # Initialize database
     init_db()
     logger.info("Database initialized")
 
-    # Initialize Telegram sender
     telegram_sender = TelegramSender()
-    logger.info("Telegram sender initialized")
-
-    # Initialize signal manager
     signal_manager = SignalManager(telegram_sender)
-    logger.info("Signal manager initialized")
 
-    # Initialize Telegram bot (admin commands)
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+
+    # Store signal_manager in bot_data so admin_bot can access it
+    application.bot_data["signal_manager"] = signal_manager
+
     setup_admin_handlers(application)
 
-    # Initialize scheduler for daily reports
     scheduler = AsyncIOScheduler()
     scheduler.add_job(
-        send_daily_report,
-        "cron",
-        hour=DAILY_REPORT_HOUR_UTC,
-        minute=DAILY_REPORT_MINUTE,
-        timezone="UTC",
+        send_daily_report, "cron",
+        hour=DAILY_REPORT_HOUR_UTC, minute=DAILY_REPORT_MINUTE, timezone="UTC",
     )
     scheduler.start()
-    logger.info(f"Daily report scheduled at {DAILY_REPORT_HOUR_UTC:02d}:{DAILY_REPORT_MINUTE:02d} UTC")
 
-    # Start the Telegram bot
     await application.initialize()
     await application.start()
     await application.updater.start_polling(drop_pending_updates=True)
 
     logger.info("=" * 50)
-    logger.info("  Aboud Trading Bot v1.0 - STARTED")
-    logger.info("=" * 50)
-    logger.info(f"  Pairs: EURUSD, USDJPY, USDCHF")
-    logger.info(f"  Timeframe: 15 minutes")
-    logger.info(f"  Trading hours: {TRADING_START_HOUR_UTC}:00 - {TRADING_END_HOUR_UTC}:00 UTC")
-    logger.info(f"  Signal confirm delay: {SIGNAL_CONFIRM_DELAY_SECONDS}s")
-    logger.info(f"  Signals enabled: {is_signals_enabled()}")
+    logger.info("  Aboud Trading Bot v3.0 - STARTED")
+    logger.info(f"  Timezone: UTC+{BOT_UTC_OFFSET}")
+    logger.info(f"  Confirm window: {SIGNAL_CONFIRM_MIN_SECONDS}-{SIGNAL_CONFIRM_MAX_SECONDS}s")
     logger.info("=" * 50)
 
-    # Send startup notification
-    await telegram_sender.send_text(
-        "🟢 <b>Aboud Trading Bot Started!</b>\n\n"
-        "📊 Pairs: EURUSD, USDJPY, USDCHF\n"
-        "⏱ Timeframe: 15 minutes\n"
-        "🔄 Status: Active\n\n"
-        "Use /help for control panel commands.",
-        chat_id=None  # Sends to the channel
-    )
+    # FIX: Only send startup message ONCE per deploy, not on every restart/ping
+    last_start = get_setting("last_startup_id", "")
+    import os
+    current_deploy = os.getenv("RENDER_GIT_COMMIT", "local")[:8]
+    if last_start != current_deploy:
+        set_setting("last_startup_id", current_deploy)
+        await telegram_sender.send_text(
+            f"🟢 <b>Aboud Trading Bot v3.0 Started!</b>\n\n"
+            f"📊 Pairs: EURUSD, USDJPY, USDCHF\n"
+            f"⏱ Timeframe: 15 minutes\n"
+            f"🕐 Timezone: UTC+{BOT_UTC_OFFSET}\n"
+            f"⏳ Signal confirm: {SIGNAL_CONFIRM_MIN_SECONDS//60}-{SIGNAL_CONFIRM_MAX_SECONDS//60} min\n"
+            f"🔒 One trade at a time\n"
+            f"🔄 Status: Active",
+        )
 
-    # Keep running
     try:
         while True:
             await asyncio.sleep(1)
     except (KeyboardInterrupt, SystemExit):
-        logger.info("Shutting down...")
+        pass
     finally:
         await application.updater.stop()
         await application.stop()
@@ -239,25 +172,14 @@ async def run_bot():
 
 
 def run_flask():
-    """Run Flask in a separate thread."""
-    app.run(
-        host="0.0.0.0",
-        port=WEBHOOK_PORT,
-        debug=False,
-        use_reloader=False,
-    )
+    app.run(host="0.0.0.0", port=WEBHOOK_PORT, debug=False, use_reloader=False)
 
 
 def main():
-    """Main entry point."""
-    logger.info("Starting Aboud Trading Bot...")
-
-    # Run Flask webhook server in a separate thread
-    flask_thread = threading.Thread(target=run_flask, daemon=True)
-    flask_thread.start()
-    logger.info(f"Flask webhook server started on port {WEBHOOK_PORT}")
-
-    # Run the async bot
+    logger.info("Starting Aboud Trading Bot v3.0...")
+    t = threading.Thread(target=run_flask, daemon=True)
+    t.start()
+    logger.info(f"Flask on port {WEBHOOK_PORT}")
     asyncio.run(run_bot())
 
 
