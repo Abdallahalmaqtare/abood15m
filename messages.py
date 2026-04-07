@@ -1,249 +1,225 @@
 """
-Aboud Trading Bot - Message Formatter (FIXED)
-================================================
-Formats all Telegram messages to match the design style.
-Uses emojis and structured layout similar to the reference image.
-
-FIX: All times now displayed with UTC+3 label
+Aboud Trading Bot - Messages v3
+=================================
+All display times in UTC+3
+Added: format_recent_trades, format_active_trade, format_overall_stats
 """
+from datetime import datetime
+from config import BOT_TIMEZONE, BOT_UTC_OFFSET
 
-from datetime import datetime, timezone
+
+def _now():
+    return datetime.now(BOT_TIMEZONE)
 
 
 def format_signal_message(pair, direction, entry_time, stats):
-    """
-    Format a trading signal message.
-
-    Args:
-        pair: e.g. "EURUSD"
-        direction: "CALL" or "PUT"
-        entry_time: e.g. "09:15" (already in UTC+3)
-        stats: dict with total_wins, total_losses
-    """
-    direction_emoji = "🟢" if direction == "CALL" else "🔴"
-    direction_text = "CALL" if direction == "CALL" else "PUT"
-
-    total = stats.get("total_wins", 0) + stats.get("total_losses", 0)
-    wins = stats.get("total_wins", 0)
-    losses = stats.get("total_losses", 0)
-    win_rate = round((wins / total) * 100) if total > 0 else 0
+    de = "🟢" if direction == "CALL" else "🔴"
+    w = stats.get("total_wins", 0)
+    l = stats.get("total_losses", 0)
+    t = w + l
+    r = round((w / t) * 100) if t > 0 else 0
 
     msg = (
         f"<b>Aboud Trading 15M POCKETOPTION BOT</b> 🔵\n"
-        f"》 ABOUD 15 M 《\n"
-        f"\n"
+        f"》 ABOUD 15 M 《\n\n"
         f"📊 <b>{pair}</b>\n"
-        f"{direction_emoji} <b>{direction_text}</b>\n"
-        f"🕐 <b>{entry_time} (UTC+3)</b>\n"
-        f"⏳ <b>15 minutes</b>\n"
-        f"\n"
+        f"{de} <b>{direction}</b>\n"
+        f"🕐 <b>{entry_time}</b>\n"
+        f"⏳ <b>15 minutes</b>\n\n"
     )
-
-    if total > 0:
-        msg += (
-            f"Win: {wins} | Loss: {losses} ({win_rate}%)\n"
-            f"Pair {pair}: {wins}x{losses} ({win_rate}%)\n"
-        )
-
+    if t > 0:
+        msg += f"Win: {w} | Loss: {l} ({r}%)\nPair {pair}: {w}x{l} ({r}%)\n"
     return msg
 
 
 def format_result_message(pair, direction, entry_time, result):
-    """
-    Format a trade result message.
-
-    Args:
-        pair: e.g. "EURUSD"
-        direction: "CALL" or "PUT"
-        entry_time: e.g. "09:15" (already in UTC+3)
-        result: "WIN" or "LOSS"
-    """
+    arrow = "⬆️" if direction == "CALL" else "⬇️"
     if result == "WIN":
-        result_emoji = "✅"
-        arrow = "⬆️" if direction == "CALL" else "⬇️"
-        msg = (
-            f"<b>Aboud Trading 15M POCKETOPTION BOT</b> 🔵\n"
-            f"\n"
-            f"{result_emoji} → {pair} {entry_time} (UTC+3) {arrow}\n"
-            f"\n"
+        return (
+            f"<b>Aboud Trading 15M POCKETOPTION BOT</b> 🔵\n\n"
+            f"✅ → {pair} {entry_time} {arrow}\n\n"
             f"<b>🏆 WIN!</b>\n"
         )
     else:
-        result_emoji = "❌"
-        arrow = "⬆️" if direction == "CALL" else "⬇️"
-        msg = (
-            f"<b>Aboud Trading 15M POCKETOPTION BOT</b> 🔵\n"
-            f"\n"
-            f"{result_emoji} → {pair} {entry_time} (UTC+3) {arrow}\n"
-            f"\n"
+        return (
+            f"<b>Aboud Trading 15M POCKETOPTION BOT</b> 🔵\n\n"
+            f"❌ → {pair} {entry_time} {arrow}\n\n"
             f"<b>💔 LOSS</b>\n"
         )
 
-    return msg
-
 
 def format_stats_message(stats_list):
-    """
-    Format statistics message.
-
-    Args:
-        stats_list: list of dicts with pair stats
-    """
-    total_wins = sum(s.get("total_wins", 0) for s in stats_list)
-    total_losses = sum(s.get("total_losses", 0) for s in stats_list)
-    total = total_wins + total_losses
-    overall_rate = round((total_wins / total) * 100) if total > 0 else 0
+    tw = sum(s.get("total_wins", 0) for s in stats_list)
+    tl = sum(s.get("total_losses", 0) for s in stats_list)
+    t = tw + tl
+    r = round((tw / t) * 100) if t > 0 else 0
 
     msg = (
         f"<b>📊 Aboud Trading - Statistics</b>\n"
-        f"{'━' * 30}\n"
-        f"\n"
-        f"<b>📈 Overall Performance:</b>\n"
-        f"✅ Total Wins: <b>{total_wins}</b>\n"
-        f"❌ Total Losses: <b>{total_losses}</b>\n"
-        f"📊 Total Trades: <b>{total}</b>\n"
-        f"🎯 Win Rate: <b>{overall_rate}%</b>\n"
-        f"\n"
-        f"{'━' * 30}\n"
-        f"<b>📋 Per Pair Breakdown:</b>\n"
-        f"\n"
+        f"{'━' * 30}\n\n"
+        f"✅ Wins: <b>{tw}</b> | ❌ Losses: <b>{tl}</b>\n"
+        f"📊 Total: <b>{t}</b> | 🎯 Rate: <b>{r}%</b>\n\n"
     )
-
     for s in stats_list:
-        pair = s.get("pair", "?")
+        p = s.get("pair", "?")
         w = s.get("total_wins", 0)
         l = s.get("total_losses", 0)
-        t = w + l
-        r = round((w / t) * 100) if t > 0 else 0
-        msg += f"  📊 <b>{pair}</b>: ✅ {w} | ❌ {l} | 🎯 {r}%\n"
-
-    msg += (
-        f"\n"
-        f"{'━' * 30}\n"
-        f"<i>🤖 Aboud Trading Bot v1.0</i>\n"
-    )
-
+        st = w + l
+        sr = round((w / st) * 100) if st > 0 else 0
+        msg += f"  📊 <b>{p}</b>: ✅ {w} | ❌ {l} | 🎯 {sr}%\n"
     return msg
 
 
-def format_daily_report(daily_stats, today_trades):
-    """
-    Format the daily report message.
-
-    Args:
-        daily_stats: list of dicts with pair daily stats
-        today_trades: list of trade dicts for today
-    """
-    from datetime import datetime, timezone, timedelta
-    from config import BOT_TIMEZONE
-
-    # Use UTC+3 for date display
-    now_local = datetime.now(BOT_TIMEZONE)
-    date_str = now_local.strftime("%Y-%m-%d")
-
-    total_d_wins = sum(s.get("daily_wins", 0) for s in daily_stats)
-    total_d_losses = sum(s.get("daily_losses", 0) for s in daily_stats)
-    total_d = total_d_wins + total_d_losses
-    daily_rate = round((total_d_wins / total_d) * 100) if total_d > 0 else 0
-
-    total_wins = sum(s.get("total_wins", 0) for s in daily_stats)
-    total_losses = sum(s.get("total_losses", 0) for s in daily_stats)
-    total_all = total_wins + total_losses
-    overall_rate = round((total_wins / total_all) * 100) if total_all > 0 else 0
+def format_overall_stats(stats_list):
+    """All-time cumulative statistics."""
+    tw = sum(s.get("total_wins", 0) for s in stats_list)
+    tl = sum(s.get("total_losses", 0) for s in stats_list)
+    t = tw + tl
+    r = round((tw / t) * 100) if t > 0 else 0
 
     msg = (
-        f"<b>📋 Aboud Trading - Daily Report</b>\n"
-        f"<b>📅 {date_str}</b>\n"
+        f"<b>📈 الإحصائيات التراكمية</b>\n"
+        f"{'━' * 32}\n\n"
+        f"✅ إجمالي الأرباح: <b>{tw}</b>\n"
+        f"❌ إجمالي الخسائر: <b>{tl}</b>\n"
+        f"📊 إجمالي الصفقات: <b>{t}</b>\n"
+        f"🎯 نسبة النجاح: <b>{r}%</b>\n\n"
         f"{'━' * 32}\n"
-        f"\n"
-        f"<b>📊 Today's Results:</b>\n"
-        f"✅ Wins: <b>{total_d_wins}</b>\n"
-        f"❌ Losses: <b>{total_d_losses}</b>\n"
-        f"📊 Total: <b>{total_d}</b>\n"
-        f"🎯 Win Rate: <b>{daily_rate}%</b>\n"
-        f"\n"
+        f"<b>تفصيل حسب الزوج:</b>\n\n"
+    )
+    for s in stats_list:
+        p = s.get("pair", "?")
+        w = s.get("total_wins", 0)
+        l = s.get("total_losses", 0)
+        st = w + l
+        sr = round((w / st) * 100) if st > 0 else 0
+        msg += f"  📊 <b>{p}</b>: ✅ {w} | ❌ {l} | 🎯 {sr}%\n"
+
+    msg += f"\n<i>🤖 Aboud Trading Bot v3.0</i>\n"
+    return msg
+
+
+def format_daily_report(daily_stats, today_trades=None):
+    now = _now()
+    dw = sum(s.get("daily_wins", 0) for s in daily_stats)
+    dl = sum(s.get("daily_losses", 0) for s in daily_stats)
+    dt = dw + dl
+    dr = round((dw / dt) * 100) if dt > 0 else 0
+
+    tw = sum(s.get("total_wins", 0) for s in daily_stats)
+    tl = sum(s.get("total_losses", 0) for s in daily_stats)
+    ta = tw + tl
+    tr = round((tw / ta) * 100) if ta > 0 else 0
+
+    msg = (
+        f"<b>📋 إحصائيات اليوم</b>\n"
+        f"<b>📅 {now.strftime('%Y-%m-%d')}</b>\n"
+        f"{'━' * 32}\n\n"
+        f"✅ أرباح: <b>{dw}</b> | ❌ خسائر: <b>{dl}</b>\n"
+        f"📊 المجموع: <b>{dt}</b> | 🎯 النسبة: <b>{dr}%</b>\n\n"
         f"{'━' * 32}\n"
-        f"<b>📈 All-Time Performance:</b>\n"
-        f"✅ Wins: <b>{total_wins}</b>\n"
-        f"❌ Losses: <b>{total_losses}</b>\n"
-        f"📊 Total: <b>{total_all}</b>\n"
-        f"🎯 Win Rate: <b>{overall_rate}%</b>\n"
-        f"\n"
-        f"{'━' * 32}\n"
-        f"<b>📋 Per Pair (Today):</b>\n"
-        f"\n"
+        f"<b>📈 الإجمالي الكلي:</b>\n"
+        f"✅ {tw} | ❌ {tl} | 🎯 {tr}%\n\n"
     )
 
     for s in daily_stats:
-        pair = s.get("pair", "?")
-        dw = s.get("daily_wins", 0)
-        dl = s.get("daily_losses", 0)
-        dt = dw + dl
-        dr = round((dw / dt) * 100) if dt > 0 else 0
-        msg += (
-            f"  📊 <b>{pair}</b>: ✅ {dw} | ❌ {dl} | 🎯 {dr}%\n"
-        )
+        p = s.get("pair", "?")
+        w = s.get("daily_wins", 0)
+        l = s.get("daily_losses", 0)
+        st = w + l
+        sr = round((w / st) * 100) if st > 0 else 0
+        msg += f"  📊 <b>{p}</b>: ✅ {w} | ❌ {l} | 🎯 {sr}%\n"
 
-    msg += (
-        f"\n"
-        f"{'━' * 32}\n"
-        f"<i>🤖 Aboud Trading Bot v1.0</i>\n"
-    )
-
+    msg += f"\n<i>🤖 Aboud Trading Bot v3.0</i>\n"
     return msg
+
+
+def format_recent_trades(trades):
+    """Format last N trades."""
+    if not trades:
+        return "<b>📋 آخر الصفقات</b>\n\nلا توجد صفقات سابقة."
+
+    msg = f"<b>📋 آخر {len(trades)} صفقات</b>\n{'━' * 32}\n\n"
+    for t in trades:
+        re = "✅" if t.get("result") == "WIN" else "❌"
+        pair = t.get("pair", "?")
+        dire = t.get("direction", "?")
+        arrow = "⬆️" if dire == "CALL" else "⬇️"
+        ep = t.get("entry_price")
+        xp = t.get("exit_price")
+        ep_str = f"{ep:.5f}" if ep else "N/A"
+        xp_str = f"{xp:.5f}" if xp else "N/A"
+
+        msg += (
+            f"{re} <b>{pair}</b> {arrow} {dire}\n"
+            f"   Entry: {ep_str} → Exit: {xp_str}\n\n"
+        )
+    return msg
+
+
+def format_active_trade(trade):
+    """Format current active trade info."""
+    if not trade:
+        return "<b>📊 الصفقة النشطة</b>\n\n⚪ لا توجد صفقة نشطة حالياً."
+
+    pair = trade.get("pair", "?")
+    dire = trade.get("direction", "?")
+    arrow = "⬆️" if dire == "CALL" else "⬇️"
+    ep = trade.get("entry_price")
+    ep_str = f"{ep:.5f}" if ep else "قيد الانتظار"
+
+    return (
+        f"<b>📊 الصفقة النشطة</b>\n"
+        f"{'━' * 32}\n\n"
+        f"📊 <b>{pair}</b> {arrow} {dire}\n"
+        f"💰 سعر الدخول: {ep_str}\n"
+        f"⏳ المدة: 15 دقيقة\n"
+        f"🔄 الحالة: <b>جارية...</b>\n\n"
+        f"💡 استخدم /close لإغلاق يدوي"
+    )
 
 
 def format_signal_cancelled_message(pair, direction, reason="Signal reversed"):
-    """Format message when a pending signal is cancelled."""
-    msg = (
+    return (
         f"<b>Aboud Trading 15M</b>\n"
-        f"⚠️ Signal Cancelled\n"
-        f"\n"
+        f"⚠️ Signal Cancelled\n\n"
         f"📊 {pair} | {direction}\n"
         f"📝 Reason: {reason}\n"
     )
-    return msg
 
 
 def format_admin_help():
-    """Format admin help message."""
-    msg = (
-        f"<b>🛠 Aboud Trading - Control Panel</b>\n"
-        f"{'━' * 32}\n"
-        f"\n"
-        f"<b>Available Commands:</b>\n"
-        f"\n"
-        f"/start - Start the bot\n"
-        f"/help - Show this help message\n"
-        f"/stats - View current statistics\n"
-        f"/daily - View today's report\n"
-        f"/enable - Enable signal sending\n"
-        f"/disable - Disable signal sending\n"
-        f"/reset - Reset all statistics to zero\n"
-        f"/status - Check bot status\n"
-        f"/pairs - View active trading pairs\n"
-        f"\n"
-        f"<i>🔒 Admin commands only</i>\n"
+    return (
+        f"<b>🛠 Aboud Trading - لوحة التحكم</b>\n"
+        f"{'━' * 32}\n\n"
+        f"/start - تشغيل البوت\n"
+        f"/stats - إحصائيات اليوم\n"
+        f"/overall - الإحصائيات التراكمية\n"
+        f"/recent - آخر 10 صفقات\n"
+        f"/active - الصفقة النشطة\n"
+        f"/close - إغلاق الصفقة يدوياً\n"
+        f"/news - الأخبار القادمة\n"
+        f"/enable - تشغيل الإشارات\n"
+        f"/disable - إيقاف الإشارات\n"
+        f"/reset - تصفير النتائج\n"
+        f"/status - حالة البوت\n\n"
+        f"<i>🔒 أوامر الأدمن فقط</i>\n"
     )
-    return msg
 
 
 def format_status_message(signals_enabled, pending_count, today_count):
-    """Format bot status message."""
-    status_emoji = "🟢" if signals_enabled else "🔴"
-    status_text = "ACTIVE" if signals_enabled else "PAUSED"
-
-    msg = (
-        f"<b>🤖 Aboud Trading Bot Status</b>\n"
-        f"{'━' * 32}\n"
-        f"\n"
-        f"Signal Status: {status_emoji} <b>{status_text}</b>\n"
-        f"Pending Signals: <b>{pending_count}</b>\n"
-        f"Today's Trades: <b>{today_count}</b>\n"
-        f"Pairs: EURUSD, USDJPY, USDCHF\n"
-        f"Timeframe: 15 Minutes\n"
-        f"Timezone: UTC+3\n"
-        f"\n"
-        f"<i>🤖 Aboud Trading Bot v1.0</i>\n"
+    se = "🟢" if signals_enabled else "🔴"
+    st = "نشط" if signals_enabled else "متوقف"
+    now = _now()
+    return (
+        f"<b>🤖 حالة البوت</b>\n"
+        f"{'━' * 32}\n\n"
+        f"الإشارات: {se} <b>{st}</b>\n"
+        f"إشارات معلقة: <b>{pending_count}</b>\n"
+        f"صفقات اليوم: <b>{today_count}</b>\n"
+        f"الأزواج: EURUSD, USDJPY, USDCHF\n"
+        f"الفريم: 15 دقيقة\n"
+        f"التوقيت: UTC+{BOT_UTC_OFFSET}\n"
+        f"الوقت: {now.strftime('%H:%M:%S')}\n\n"
+        f"<i>🤖 Aboud Trading Bot v3.0</i>\n"
     )
-    return msg
