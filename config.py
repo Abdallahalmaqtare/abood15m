@@ -1,6 +1,6 @@
 """
-Aboud Trading Bot - Configuration v3.1
-FIX: Persistent DB path on Render + startup flag file
+Aboud Trading Bot - Config v4 (FINAL)
+Uses Neon PostgreSQL for PERMANENT data storage.
 """
 import os
 from datetime import timezone, timedelta
@@ -32,14 +32,12 @@ TRADING_END_HOUR_UTC = 24
 BOT_UTC_OFFSET = int(os.getenv("BOT_UTC_OFFSET", "3"))
 BOT_TIMEZONE = timezone(timedelta(hours=BOT_UTC_OFFSET))
 
-# DATABASE - persistent path on Render
-_render_src = "/opt/render/project/src"
-if os.path.isdir(_render_src):
-    DATABASE_PATH = os.getenv("DATABASE_PATH", f"{_render_src}/aboud_trading.db")
-    STARTUP_FLAG_FILE = f"{_render_src}/.bot_started"
-else:
-    DATABASE_PATH = os.getenv("DATABASE_PATH", "aboud_trading.db")
-    STARTUP_FLAG_FILE = ".bot_started"
+# ============================================
+# DATABASE - Neon PostgreSQL (PERMANENT!)
+# Set DATABASE_URL in Render env vars
+# Example: postgresql://user:pass@ep-xxx.neon.tech/dbname?sslmode=require
+# ============================================
+DATABASE_URL = os.getenv("DATABASE_URL", "")
 
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "aboud_trading_secret_2024")
 WEBHOOK_PORT = int(os.getenv("PORT", "10000"))
