@@ -1,29 +1,19 @@
 """
-Aboud Trading Bot - Main v3.1
-FIXES:
-- Startup msg only once per 30min (FILE-based, not DB)
-- DB in persistent Render path
-- Graceful crash recovery
+Aboud Trading Bot - Main v4 (FINAL)
+Startup message tracked IN DATABASE (PostgreSQL = permanent).
 """
-import asyncio
-import logging
-import threading
-import json
-import os
-import time
+import asyncio, logging, threading, json, time
 from datetime import datetime, timezone
-
 from flask import Flask, request, jsonify
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from telegram.ext import Application
-
 from config import (
     TELEGRAM_BOT_TOKEN, WEBHOOK_SECRET, WEBHOOK_PORT,
     DAILY_REPORT_HOUR_UTC, DAILY_REPORT_MINUTE,
     SIGNAL_CONFIRM_MIN_SECONDS, SIGNAL_CONFIRM_MAX_SECONDS,
-    BOT_UTC_OFFSET, DEBUG, STARTUP_FLAG_FILE, DATABASE_PATH,
+    BOT_UTC_OFFSET, DEBUG, DATABASE_URL,
 )
-from database import init_db, get_daily_stats, get_today_trades, is_signals_enabled
+from database import init_db, get_daily_stats, get_today_trades, is_signals_enabled, get_setting, set_setting
 from signal_manager import SignalManager
 from telegram_sender import TelegramSender
 from price_service import price_service
@@ -44,13 +34,7 @@ loop = None
 
 @app.route("/", methods=["GET"])
 def health():
-    return jsonify({
-        "status": "ok",
-        "bot": "Aboud Trading Bot v3.1",
-        "signals": is_signals_enabled(),
-        "db": DATABASE_PATH,
-        "db_exists": os.path.exists(DATABASE_PATH),
-    })
+    return jsonify({"status": "ok", "bot": "v4", "pg": bool(DATABASE_URL)})
 
 
 @app.route("/webhook", methods=["POST"])
@@ -73,8 +57,6 @@ def webhook():
         if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
             return jsonify({"error": "Unauthorized"}), 401
 
-        logger.info(f"Webhook: {json.dumps(data, default=str)}")
-
         if signal_manager and loop:
             fut = asyncio.run_coroutine_threadsafe(signal_manager.process_webhook_signal(data), loop)
             res = fut.result(timeout=10)
@@ -91,17 +73,18 @@ def webhook_test():
 
 
 def _should_send_startup():
-    """FILE-based startup check. Only send if last was >30 min ago."""
+    """Check in DATABASE if startup msg was sent recently. DB = permanent!"""
     try:
-        if os.path.exists(STARTUP_FLAG_FILE):
-            elapsed = time.time() - os.path.getmtime(STARTUP_FLAG_FILE)
-            if elapsed < 1800:
+        last = get_setting("last_startup", "")
+        if last:
+            elapsed = time.time() - float(last)
+            if elapsed < 1800:  # 30 min
                 logger.info(f"Startup msg skipped ({elapsed:.0f}s ago)")
                 return False
-        with open(STARTUP_FLAG_FILE, "w") as f:
-            f.write(str(time.time()))
+        set_setting("last_startup", str(time.time()))
         return True
-    except:
+    except Exception as e:
+        logger.warning(f"Startup check err: {e}")
         return True
 
 
@@ -117,7 +100,7 @@ async def run_bot():
     loop = asyncio.get_event_loop()
 
     init_db()
-    logger.info(f"DB: {DATABASE_PATH} exists={os.path.exists(DATABASE_PATH)}")
+    logger.info(f"DB: {'PostgreSQL (PERMANENT)' if DATABASE_URL else 'SQLite (LOCAL)'}")
 
     telegram_sender = TelegramSender()
     signal_manager = SignalManager(telegram_sender)
@@ -135,17 +118,16 @@ async def run_bot():
     await application.updater.start_polling(drop_pending_updates=True)
 
     logger.info("=" * 50)
-    logger.info("  Aboud Trading Bot v3.1 STARTED")
-    logger.info(f"  DB: {DATABASE_PATH}")
+    logger.info("  Aboud Trading Bot v4.0 FINAL")
+    logger.info(f"  DB: {'PostgreSQL' if DATABASE_URL else 'SQLite'}")
     logger.info("=" * 50)
 
     if _should_send_startup():
         await telegram_sender.send_text(
-            f"🟢 <b>Aboud Trading Bot v3.1</b>\n\n"
+            f"🟢 <b>Aboud Trading Bot v4.0</b>\n\n"
             f"📊 EURUSD, USDJPY, USDCHF\n"
             f"⏱ 15 min | 🕐 UTC+{BOT_UTC_OFFSET}\n"
-            f"⏳ Confirm: {SIGNAL_CONFIRM_MIN_SECONDS//60}-{SIGNAL_CONFIRM_MAX_SECONDS//60} min\n"
-            f"🔒 One trade at a time\n"
+            f"💾 DB: {'☁️ PostgreSQL' if DATABASE_URL else '📁 SQLite'}\n"
             f"🔄 Active",
         )
 
@@ -170,7 +152,6 @@ def run_flask():
 def main():
     threading.Thread(target=run_flask, daemon=True).start()
     asyncio.run(run_bot())
-
 
 if __name__ == "__main__":
     main()
