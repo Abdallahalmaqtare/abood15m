@@ -55,6 +55,9 @@ BOT_TIMEZONE = timezone(timedelta(hours=BOT_UTC_OFFSET))
 # DATABASE
 # ============================================
 DATABASE_PATH = os.getenv("DATABASE_PATH", "aboud_trading.db")
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+USE_POSTGRES = bool(DATABASE_URL)
+
 
 # ============================================
 # WEBHOOK
