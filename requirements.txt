@@ -16,5 +16,8 @@ aiohttp==3.11.11
 # Scheduler
 APScheduler==3.11.0
 
+# Database (PostgreSQL)
+psycopg2-binary==2.9.10
+
 # Utilities
 python-dotenv==1.0.1
