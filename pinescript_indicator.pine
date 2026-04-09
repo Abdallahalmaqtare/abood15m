@@ -1,5 +1,5 @@
 // =====================================================
-// ABOUD TRADING BOT - TradingView Pine Script v1.0
+// ABOUD TRADING BOT - TradingView Pine Script v1.1
 // =====================================================
 // This script generates CALL/PUT signals on the 15-minute
 // timeframe using multiple confirmation layers:
@@ -10,6 +10,9 @@
 //   5. ATR Candle Quality Filter
 //
 // Signals are sent via TradingView Alerts → Webhook → Bot
+// Added in v1.1:
+// - target_entry_time in webhook payload
+// - signal_time and signal_close for better server accuracy/debugging
 // =====================================================
 
 //@version=5
@@ -66,25 +69,20 @@ rsi_put_ok = rsi_val < rsi_put_max
 
 // --- Supertrend ---
 [st_line, st_dir] = ta.supertrend(st_multiplier, st_period)
-st_bullish = st_dir < 0   // Price above Supertrend
-st_bearish = st_dir > 0   // Price below Supertrend
+st_bullish = st_dir < 0
+st_bearish = st_dir > 0
 
 // --- ADX ---
-// ADX calculation
-dmi_plus = ta.change(ta.highest(high, 1)) 
+dmi_plus = ta.change(ta.highest(high, 1))
 dmi_minus = -ta.change(ta.lowest(low, 1))
-
 tr_val = ta.tr(true)
 plus_dm = dmi_plus > dmi_minus and dmi_plus > 0 ? dmi_plus : 0
 minus_dm = dmi_minus > dmi_plus and dmi_minus > 0 ? dmi_minus : 0
-
 smoothed_tr = ta.rma(tr_val, adx_len)
 smoothed_plus = ta.rma(plus_dm, adx_len)
 smoothed_minus = ta.rma(minus_dm, adx_len)
-
 plus_di = smoothed_tr != 0 ? (smoothed_plus / smoothed_tr) * 100 : 0
 minus_di = smoothed_tr != 0 ? (smoothed_minus / smoothed_tr) * 100 : 0
-
 dx = (plus_di + minus_di) != 0 ? math.abs(plus_di - minus_di) / (plus_di + minus_di) * 100 : 0
 adx_val = ta.rma(dx, adx_len)
 adx_ok = adx_val > adx_min
@@ -95,7 +93,6 @@ candle_range = high - low
 candle_body = math.abs(close - open)
 body_ratio = candle_range > 0 ? candle_body / candle_range : 0
 atr_ratio = atr_val > 0 ? candle_range / atr_val : 0
-
 candle_quality = body_ratio >= min_body_ratio and atr_ratio <= max_atr_multiplier and candle_range > 0
 
 // --- Price Position ---
@@ -105,66 +102,41 @@ price_below_ema = close < ema_fast
 // =====================================================
 // SIGNAL LOGIC
 // =====================================================
-
-// CALL Signal Conditions (all must be true)
 call_signal = ema_bullish and price_above_ema and rsi_call_ok and st_bullish and adx_ok and candle_quality
-
-// PUT Signal Conditions (all must be true)
 put_signal = ema_bearish and price_below_ema and rsi_put_ok and st_bearish and adx_ok and candle_quality
-
-// Detect NEW signals only (prevent repeated signals)
 new_call = call_signal and not call_signal[1]
 new_put = put_signal and not put_signal[1]
-
-// Also detect when signal DISAPPEARS (for cancel logic)
 call_disappeared = not call_signal and call_signal[1]
 put_disappeared = not put_signal and put_signal[1]
+
+next_entry_time = time_close + (15 * 60 * 1000)
 
 // =====================================================
 // PLOTTING
 // =====================================================
-
-// EMA Lines
 plot(show_ema ? ema_fast : na, "EMA Fast", color=color.new(color.blue, 0), linewidth=2)
 plot(show_ema ? ema_slow : na, "EMA Slow", color=color.new(color.orange, 0), linewidth=2)
-
-// Supertrend Line
 st_color = st_bullish ? color.new(color.green, 20) : color.new(color.red, 20)
 plot(show_supertrend ? st_line : na, "Supertrend", color=st_color, linewidth=2, style=plot.style_linebr)
-
-// Signal Arrows
-plotshape(show_signals and new_call ? true : false, "CALL Signal",
-     style=shape.triangleup, location=location.belowbar,
-     color=color.new(color.green, 0), size=size.normal, text="CALL")
-
-plotshape(show_signals and new_put ? true : false, "PUT Signal",
-     style=shape.triangledown, location=location.abovebar,
-     color=color.new(color.red, 0), size=size.normal, text="PUT")
-
-// Background highlight when signal conditions are active
+plotshape(show_signals and new_call ? true : false, "CALL Signal", style=shape.triangleup, location=location.belowbar, color=color.new(color.green, 0), size=size.normal, text="CALL")
+plotshape(show_signals and new_put ? true : false, "PUT Signal", style=shape.triangledown, location=location.abovebar, color=color.new(color.red, 0), size=size.normal, text="PUT")
 bgcolor(call_signal ? color.new(color.green, 92) : put_signal ? color.new(color.red, 92) : na)
 
 // =====================================================
 // INFORMATION TABLE
 // =====================================================
 var table info_table = table.new(position.top_right, 2, 8, bgcolor=color.new(color.black, 80), border_width=1)
-
 if barstate.islast
     table.cell(info_table, 0, 0, "ABOUD TRADING", text_color=color.white, bgcolor=color.new(color.blue, 30), text_size=size.small)
     table.cell(info_table, 1, 0, "15M BOT", text_color=color.white, bgcolor=color.new(color.blue, 30), text_size=size.small)
-
     table.cell(info_table, 0, 1, "EMA Trend", text_color=color.white, text_size=size.tiny)
     table.cell(info_table, 1, 1, ema_bullish ? "🟢 BULL" : "🔴 BEAR", text_color=ema_bullish ? color.green : color.red, text_size=size.tiny)
-
     table.cell(info_table, 0, 2, "RSI", text_color=color.white, text_size=size.tiny)
     table.cell(info_table, 1, 2, str.tostring(rsi_val, "#.#"), text_color=rsi_val > 50 ? color.green : color.red, text_size=size.tiny)
-
     table.cell(info_table, 0, 3, "Supertrend", text_color=color.white, text_size=size.tiny)
     table.cell(info_table, 1, 3, st_bullish ? "🟢 UP" : "🔴 DOWN", text_color=st_bullish ? color.green : color.red, text_size=size.tiny)
-
     table.cell(info_table, 0, 4, "ADX", text_color=color.white, text_size=size.tiny)
     table.cell(info_table, 1, 4, str.tostring(adx_val, "#.#"), text_color=adx_ok ? color.green : color.gray, text_size=size.tiny)
-
     table.cell(info_table, 0, 5, "Signal", text_color=color.white, text_size=size.tiny)
     signal_text = call_signal ? "🟢 CALL" : put_signal ? "🔴 PUT" : "⚪ NONE"
     table.cell(info_table, 1, 5, signal_text, text_color=color.white, text_size=size.tiny)
@@ -172,18 +144,14 @@ if barstate.islast
 // =====================================================
 // ALERTS
 // =====================================================
-
-// --- CALL Signal Alert ---
 if new_call
-    alert_msg_call = '{"secret":"' + webhook_secret + '","pair":"' + syminfo.ticker + '","direction":"CALL","action":"SIGNAL","indicators":{"ema_fast":' + str.tostring(ema_fast) + ',"ema_slow":' + str.tostring(ema_slow) + ',"rsi":' + str.tostring(rsi_val) + ',"supertrend":"UP","adx":' + str.tostring(adx_val) + '}}'
+    alert_msg_call = '{"secret":"' + webhook_secret + '","pair":"' + syminfo.ticker + '","direction":"CALL","action":"SIGNAL","target_entry_time":' + str.tostring(next_entry_time) + ',"signal_time":' + str.tostring(time_close) + ',"signal_close":' + str.tostring(close) + ',"indicators":{"ema_fast":' + str.tostring(ema_fast) + ',"ema_slow":' + str.tostring(ema_slow) + ',"rsi":' + str.tostring(rsi_val) + ',"supertrend":"UP","adx":' + str.tostring(adx_val) + '}}'
     alert(alert_msg_call, alert.freq_once_per_bar)
 
-// --- PUT Signal Alert ---
 if new_put
-    alert_msg_put = '{"secret":"' + webhook_secret + '","pair":"' + syminfo.ticker + '","direction":"PUT","action":"SIGNAL","indicators":{"ema_fast":' + str.tostring(ema_fast) + ',"ema_slow":' + str.tostring(ema_slow) + ',"rsi":' + str.tostring(rsi_val) + ',"supertrend":"DOWN","adx":' + str.tostring(adx_val) + '}}'
+    alert_msg_put = '{"secret":"' + webhook_secret + '","pair":"' + syminfo.ticker + '","direction":"PUT","action":"SIGNAL","target_entry_time":' + str.tostring(next_entry_time) + ',"signal_time":' + str.tostring(time_close) + ',"signal_close":' + str.tostring(close) + ',"indicators":{"ema_fast":' + str.tostring(ema_fast) + ',"ema_slow":' + str.tostring(ema_slow) + ',"rsi":' + str.tostring(rsi_val) + ',"supertrend":"DOWN","adx":' + str.tostring(adx_val) + '}}'
     alert(alert_msg_put, alert.freq_once_per_bar)
 
-// --- CANCEL Signal Alert (when conditions reverse) ---
 if call_disappeared
     cancel_call = '{"secret":"' + webhook_secret + '","pair":"' + syminfo.ticker + '","direction":"CALL","action":"CANCEL"}'
     alert(cancel_call, alert.freq_once_per_bar)
