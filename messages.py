@@ -1,8 +1,9 @@
 """
-Aboud Trading Bot - Messages v3
-=================================
+Aboud Trading Bot - Messages v4.0 (UPGRADED)
+==============================================
+Updated for EURUSD + GBPUSD
+Added signal score display
 All display times in UTC+3
-Added: format_recent_trades, format_active_trade, format_overall_stats
 """
 from datetime import datetime
 from config import BOT_TIMEZONE, BOT_UTC_OFFSET
@@ -12,20 +13,43 @@ def _now():
     return datetime.now(BOT_TIMEZONE)
 
 
-def format_signal_message(pair, direction, entry_time, stats):
+def _score_label(score):
+    """Return Arabic label for signal score."""
+    try:
+        s = float(score)
+    except (TypeError, ValueError):
+        return "—"
+    if s >= 9:
+        return "🔥 قوية جداً"
+    elif s >= 8:
+        return "💪 قوية"
+    elif s >= 7:
+        return "✅ جيدة"
+    else:
+        return "⚠️ ضعيفة"
+
+
+def format_signal_message(pair, direction, entry_time, stats, score=None):
     de = "🟢" if direction == "CALL" else "🔴"
     w = stats.get("total_wins", 0)
     l = stats.get("total_losses", 0)
     t = w + l
     r = round((w / t) * 100) if t > 0 else 0
 
+    score_display = ""
+    if score is not None:
+        score_display = (
+            f"📊 <b>قوة الإشارة: {score}/10</b> ({_score_label(score)})\n"
+        )
+
     msg = (
         f"<b>Aboud Trading 15M POCKETOPTION BOT</b> 🔵\n"
-        f"》 ABOUD 15 M 《\n\n"
+        f"》 ABOUD PRO 15M 《\n\n"
         f"📊 <b>{pair}</b>\n"
         f"{de} <b>{direction}</b>\n"
         f"🕐 <b>{entry_time}</b>\n"
         f"⏳ <b>15 minutes</b>\n\n"
+        f"{score_display}"
     )
     if t > 0:
         msg += f"Win: {w} | Loss: {l} ({r}%)\nPair {pair}: {w}x{l} ({r}%)\n"
@@ -95,7 +119,7 @@ def format_overall_stats(stats_list):
         sr = round((w / st) * 100) if st > 0 else 0
         msg += f"  📊 <b>{p}</b>: ✅ {w} | ❌ {l} | 🎯 {sr}%\n"
 
-    msg += f"\n<i>🤖 Aboud Trading Bot v3.0</i>\n"
+    msg += f"\n<i>🤖 Aboud Trading Bot v4.0 PRO</i>\n"
     return msg
 
 
@@ -130,7 +154,7 @@ def format_daily_report(daily_stats, today_trades=None):
         sr = round((w / st) * 100) if st > 0 else 0
         msg += f"  📊 <b>{p}</b>: ✅ {w} | ❌ {l} | 🎯 {sr}%\n"
 
-    msg += f"\n<i>🤖 Aboud Trading Bot v3.0</i>\n"
+    msg += f"\n<i>🤖 Aboud Trading Bot v4.0 PRO</i>\n"
     return msg
 
 
@@ -147,11 +171,13 @@ def format_recent_trades(trades):
         arrow = "⬆️" if dire == "CALL" else "⬇️"
         ep = t.get("entry_price")
         xp = t.get("exit_price")
+        sc = t.get("signal_score")
         ep_str = f"{ep:.5f}" if ep else "N/A"
         xp_str = f"{xp:.5f}" if xp else "N/A"
+        sc_str = f" | Score: {sc}" if sc else ""
 
         msg += (
-            f"{re} <b>{pair}</b> {arrow} {dire}\n"
+            f"{re} <b>{pair}</b> {arrow} {dire}{sc_str}\n"
             f"   Entry: {ep_str} → Exit: {xp_str}\n\n"
         )
     return msg
@@ -190,7 +216,7 @@ def format_signal_cancelled_message(pair, direction, reason="Signal reversed"):
 
 def format_admin_help():
     return (
-        f"<b>🛠 Aboud Trading - لوحة التحكم</b>\n"
+        f"<b>🛠 Aboud Trading v4.0 PRO - لوحة التحكم</b>\n"
         f"{'━' * 32}\n\n"
         f"/start - تشغيل البوت\n"
         f"/stats - إحصائيات اليوم\n"
@@ -203,6 +229,8 @@ def format_admin_help():
         f"/disable - إيقاف الإشارات\n"
         f"/reset - تصفير النتائج\n"
         f"/status - حالة البوت\n\n"
+        f"<b>الأزواج:</b> EURUSD, GBPUSD\n"
+        f"<b>الحد الأدنى للإشارة:</b> 7/10\n\n"
         f"<i>🔒 أوامر الأدمن فقط</i>\n"
     )
 
@@ -217,9 +245,10 @@ def format_status_message(signals_enabled, pending_count, today_count):
         f"الإشارات: {se} <b>{st}</b>\n"
         f"إشارات معلقة: <b>{pending_count}</b>\n"
         f"صفقات اليوم: <b>{today_count}</b>\n"
-        f"الأزواج: EURUSD, USDJPY, USDCHF\n"
+        f"الأزواج: EURUSD, GBPUSD\n"
         f"الفريم: 15 دقيقة\n"
+        f"ساعات التداول: 10:00 - 23:00 (UTC+3)\n"
         f"التوقيت: UTC+{BOT_UTC_OFFSET}\n"
         f"الوقت: {now.strftime('%H:%M:%S')}\n\n"
-        f"<i>🤖 Aboud Trading Bot v3.0</i>\n"
+        f"<i>🤖 Aboud Trading Bot v4.0 PRO</i>\n"
     )
