@@ -129,13 +129,7 @@ async def run_bot():
 
     if _should_send_startup():
         await telegram_sender.send_text(
-            f"🟢 <b>Aboud Trading Bot v5.0 PRO</b>\n\n"
-            /*f"📊 EURUSD, GBPUSD\n"
-            f"⏱ 15 min | 🕐 UTC+{BOT_UTC_OFFSET}\n"
-            f"🎯 Min Signal Score: {MIN_SIGNAL_SCORE}/10\n"
-            f"⏰ Trading: 10:00-23:00 (UTC+3)\n"
-            f"💾 DB: {'☁️ PostgreSQL' if DATABASE_URL else '📁 SQLite'}\n"
-            f"🔄 Active"*/,
+            f"🟢 <b>Aboud Trading Bot v5.0 PRO</b>\n\n",
         )
 
     try:
