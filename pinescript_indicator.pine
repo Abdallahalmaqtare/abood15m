@@ -1,53 +1,87 @@
 // =====================================================
-// ABOUD TRADING BOT - TradingView Pine Script v1.1
+// ABOUD TRADING BOT PRO - TradingView Pine Script v5.0
 // =====================================================
-// This script generates CALL/PUT signals on the 15-minute
-// timeframe using multiple confirmation layers:
-//   1. EMA 20/50 (Trend Filter)
-//   2. RSI 14 (Momentum Filter)
-//   3. Supertrend (Trend Confirmation)
-//   4. ADX (Trend Strength)
-//   5. ATR Candle Quality Filter
+// MAJOR UPGRADE: Multi-layer scoring system for HIGH
+// accuracy signals on 15-minute binary options.
 //
-// Signals are sent via TradingView Alerts → Webhook → Bot
-// Added in v1.1:
-// - target_entry_time in webhook payload
-// - signal_time and signal_close for better server accuracy/debugging
+// SCORING SYSTEM (10 points total):
+//   1. EMA Triple Alignment (9/21/50)      +1 point
+//   2. EMA 200 Major Trend                  +1 point
+//   3. RSI Momentum (strict 55/45)          +1 point
+//   4. MACD Histogram Direction             +1 point
+//   5. Supertrend Confirmation              +1 point
+//   6. ADX Trend Strength (≥25)             +1 point
+//   7. Bollinger Band Position              +1 point
+//   8. Stochastic RSI Confirmation          +1 point
+//   9. Candle Pattern Quality               +1 point
+//  10. Multi-Timeframe 1H Trend             +1 point
+//
+// Minimum score: 7/10 to fire a signal
+// Signal sent via webhook → Bot validates → Telegram
+//
+// PAIRS: EURUSD, GBPUSD only
+// TIMEFRAME: 15 Minutes
 // =====================================================
 
 //@version=5
-indicator("Aboud Trading 15M Signal Generator", overlay=true, shorttitle="ABOUD 15M")
+indicator("Aboud Trading PRO 15M", overlay=true, shorttitle="ABOUD PRO")
 
 // =====================================================
 // INPUTS
 // =====================================================
 
 // EMA Settings
-ema_fast_len = input.int(20, "EMA Fast Length", minval=5, maxval=100, group="📊 EMA Settings")
-ema_slow_len = input.int(50, "EMA Slow Length", minval=10, maxval=200, group="📊 EMA Settings")
+ema_fast_len   = input.int(9,   "EMA Fast Length",   minval=3,   maxval=50,  group="📊 EMA Settings")
+ema_mid_len    = input.int(21,  "EMA Mid Length",    minval=10,  maxval=100, group="📊 EMA Settings")
+ema_slow_len   = input.int(50,  "EMA Slow Length",   minval=20,  maxval=200, group="📊 EMA Settings")
+ema_trend_len  = input.int(200, "EMA Trend Length",  minval=100, maxval=400, group="📊 EMA Settings")
 
 // RSI Settings
-rsi_len = input.int(14, "RSI Period", minval=5, maxval=30, group="📈 RSI Settings")
-rsi_call_min = input.float(52.0, "RSI Min for CALL", minval=40, maxval=70, group="📈 RSI Settings")
-rsi_put_max = input.float(48.0, "RSI Max for PUT", minval=30, maxval=60, group="📈 RSI Settings")
+rsi_len        = input.int(14,    "RSI Period",       minval=5,  maxval=30,  group="📈 RSI Settings")
+rsi_call_min   = input.float(55,  "RSI Min for CALL", minval=50, maxval=70,  group="📈 RSI Settings")
+rsi_put_max    = input.float(45,  "RSI Max for PUT",  minval=30, maxval=50,  group="📈 RSI Settings")
+
+// MACD Settings
+macd_fast      = input.int(12, "MACD Fast",   minval=5,  maxval=30, group="📉 MACD Settings")
+macd_slow      = input.int(26, "MACD Slow",   minval=15, maxval=50, group="📉 MACD Settings")
+macd_signal    = input.int(9,  "MACD Signal", minval=3,  maxval=20, group="📉 MACD Settings")
 
 // Supertrend Settings
-st_period = input.int(10, "Supertrend Period", minval=5, maxval=30, group="🔄 Supertrend Settings")
-st_multiplier = input.float(3.0, "Supertrend Multiplier", minval=1.0, maxval=5.0, step=0.1, group="🔄 Supertrend Settings")
+st_period      = input.int(10,   "Supertrend Period",     minval=5,   maxval=30,  group="🔄 Supertrend Settings")
+st_multiplier  = input.float(2.0, "Supertrend Multiplier", minval=1.0, maxval=5.0, step=0.1, group="🔄 Supertrend Settings")
 
 // ADX Settings
-adx_len = input.int(14, "ADX Period", minval=5, maxval=30, group="💪 ADX Settings")
-adx_min = input.float(20.0, "ADX Minimum Threshold", minval=10, maxval=40, group="💪 ADX Settings")
+adx_len        = input.int(14,    "ADX Period",    minval=5,  maxval=30, group="💪 ADX Settings")
+adx_min        = input.float(25,  "ADX Minimum",   minval=15, maxval=40, group="💪 ADX Settings")
+
+// Bollinger Bands Settings
+bb_len         = input.int(20,    "BB Period",     minval=10, maxval=50, group="📏 Bollinger Bands")
+bb_mult        = input.float(2.0, "BB Multiplier", minval=1.0, maxval=3.0, step=0.1, group="📏 Bollinger Bands")
+
+// Stochastic RSI Settings
+stoch_len      = input.int(14, "Stoch RSI Length",    minval=5, maxval=30, group="🔀 Stochastic RSI")
+stoch_k        = input.int(3,  "Stoch RSI %K",       minval=1, maxval=10, group="🔀 Stochastic RSI")
+stoch_d        = input.int(3,  "Stoch RSI %D",       minval=1, maxval=10, group="🔀 Stochastic RSI")
+stoch_call_min = input.float(30, "Stoch Min CALL",   minval=10, maxval=50, group="🔀 Stochastic RSI")
+stoch_put_max  = input.float(70, "Stoch Max PUT",    minval=50, maxval=90, group="🔀 Stochastic RSI")
 
 // ATR / Candle Quality Settings
-atr_len = input.int(14, "ATR Period", minval=5, maxval=30, group="📏 Candle Quality")
-min_body_ratio = input.float(0.3, "Min Body/Range Ratio", minval=0.1, maxval=0.8, step=0.05, group="📏 Candle Quality")
-max_atr_multiplier = input.float(2.5, "Max Candle/ATR Ratio", minval=1.0, maxval=5.0, step=0.1, group="📏 Candle Quality")
+atr_len        = input.int(14,    "ATR Period",            minval=5,   maxval=30,  group="📏 Candle Quality")
+min_body_ratio = input.float(0.4, "Min Body/Range Ratio",  minval=0.1, maxval=0.8, step=0.05, group="📏 Candle Quality")
+max_atr_mult   = input.float(2.0, "Max Candle/ATR Ratio",  minval=1.0, maxval=5.0, step=0.1,  group="📏 Candle Quality")
 
-// Signal Visualization
-show_signals = input.bool(true, "Show Signal Arrows", group="🎨 Display")
-show_ema = input.bool(true, "Show EMA Lines", group="🎨 Display")
-show_supertrend = input.bool(true, "Show Supertrend", group="🎨 Display")
+// Signal Scoring
+min_score      = input.int(7,  "Minimum Signal Score", minval=5, maxval=10, group="🎯 Signal Scoring")
+
+// Cooldown
+cooldown_bars  = input.int(3, "Cooldown (bars)",       minval=1, maxval=10, group="🎯 Signal Scoring")
+
+// Display
+show_signals   = input.bool(true, "Show Signal Arrows",  group="🎨 Display")
+show_ema       = input.bool(true, "Show EMA Lines",      group="🎨 Display")
+show_supertrend= input.bool(true, "Show Supertrend",     group="🎨 Display")
+show_bb        = input.bool(true, "Show Bollinger Bands", group="🎨 Display")
+show_score     = input.bool(true, "Show Score Table",     group="🎨 Display")
 
 // Alert Settings
 webhook_secret = input.string("aboud_trading_secret_2024", "Webhook Secret", group="🔔 Alerts")
@@ -56,100 +90,248 @@ webhook_secret = input.string("aboud_trading_secret_2024", "Webhook Secret", gro
 // CALCULATIONS
 // =====================================================
 
-// --- EMA ---
-ema_fast = ta.ema(close, ema_fast_len)
-ema_slow = ta.ema(close, ema_slow_len)
-ema_bullish = ema_fast > ema_slow
-ema_bearish = ema_fast < ema_slow
+// --- Triple EMA System ---
+ema_fast   = ta.ema(close, ema_fast_len)
+ema_mid    = ta.ema(close, ema_mid_len)
+ema_slow   = ta.ema(close, ema_slow_len)
+ema_trend  = ta.ema(close, ema_trend_len)
+
+// Score 1: Triple EMA Alignment (fast > mid > slow = bullish)
+ema_bull_aligned = ema_fast > ema_mid and ema_mid > ema_slow
+ema_bear_aligned = ema_fast < ema_mid and ema_mid < ema_slow
+score_ema_call   = ema_bull_aligned ? 1 : 0
+score_ema_put    = ema_bear_aligned ? 1 : 0
+
+// Score 2: EMA 200 Major Trend
+score_trend_call = close > ema_trend ? 1 : 0
+score_trend_put  = close < ema_trend ? 1 : 0
 
 // --- RSI ---
 rsi_val = ta.rsi(close, rsi_len)
-rsi_call_ok = rsi_val > rsi_call_min
-rsi_put_ok = rsi_val < rsi_put_max
+
+// Score 3: RSI Momentum
+score_rsi_call = rsi_val > rsi_call_min and rsi_val < 75 ? 1 : 0
+score_rsi_put  = rsi_val < rsi_put_max and rsi_val > 25 ? 1 : 0
+
+// --- MACD ---
+[macd_line, signal_line, hist_val] = ta.macd(close, macd_fast, macd_slow, macd_signal)
+
+// Score 4: MACD Histogram positive/negative and growing
+score_macd_call = hist_val > 0 and hist_val > hist_val[1] ? 1 : 0
+score_macd_put  = hist_val < 0 and hist_val < hist_val[1] ? 1 : 0
 
 // --- Supertrend ---
 [st_line, st_dir] = ta.supertrend(st_multiplier, st_period)
 st_bullish = st_dir < 0
 st_bearish = st_dir > 0
 
+// Score 5: Supertrend
+score_st_call = st_bullish ? 1 : 0
+score_st_put  = st_bearish ? 1 : 0
+
 // --- ADX ---
-dmi_plus = ta.change(ta.highest(high, 1))
+dmi_plus  = ta.change(ta.highest(high, 1))
 dmi_minus = -ta.change(ta.lowest(low, 1))
-tr_val = ta.tr(true)
-plus_dm = dmi_plus > dmi_minus and dmi_plus > 0 ? dmi_plus : 0
-minus_dm = dmi_minus > dmi_plus and dmi_minus > 0 ? dmi_minus : 0
-smoothed_tr = ta.rma(tr_val, adx_len)
-smoothed_plus = ta.rma(plus_dm, adx_len)
+tr_val    = ta.tr(true)
+plus_dm   = dmi_plus > dmi_minus and dmi_plus > 0 ? dmi_plus : 0
+minus_dm  = dmi_minus > dmi_plus and dmi_minus > 0 ? dmi_minus : 0
+smoothed_tr    = ta.rma(tr_val, adx_len)
+smoothed_plus  = ta.rma(plus_dm, adx_len)
 smoothed_minus = ta.rma(minus_dm, adx_len)
-plus_di = smoothed_tr != 0 ? (smoothed_plus / smoothed_tr) * 100 : 0
+plus_di  = smoothed_tr != 0 ? (smoothed_plus / smoothed_tr) * 100 : 0
 minus_di = smoothed_tr != 0 ? (smoothed_minus / smoothed_tr) * 100 : 0
-dx = (plus_di + minus_di) != 0 ? math.abs(plus_di - minus_di) / (plus_di + minus_di) * 100 : 0
-adx_val = ta.rma(dx, adx_len)
-adx_ok = adx_val > adx_min
+dx       = (plus_di + minus_di) != 0 ? math.abs(plus_di - minus_di) / (plus_di + minus_di) * 100 : 0
+adx_val  = ta.rma(dx, adx_len)
 
-// --- ATR / Candle Quality ---
-atr_val = ta.atr(atr_len)
+// Score 6: ADX Strength + DI direction
+score_adx_call = adx_val > adx_min and plus_di > minus_di ? 1 : 0
+score_adx_put  = adx_val > adx_min and minus_di > plus_di ? 1 : 0
+
+// --- Bollinger Bands ---
+bb_basis = ta.sma(close, bb_len)
+bb_dev   = bb_mult * ta.stdev(close, bb_len)
+bb_upper = bb_basis + bb_dev
+bb_lower = bb_basis - bb_dev
+
+// Score 7: BB Position (price above basis for CALL, below for PUT)
+// Also check not too extended (not touching outer bands)
+score_bb_call = close > bb_basis and close < bb_upper ? 1 : 0
+score_bb_put  = close < bb_basis and close > bb_lower ? 1 : 0
+
+// --- Stochastic RSI ---
+rsi_for_stoch = ta.rsi(close, stoch_len)
+stoch_rsi_k   = ta.sma(ta.stoch(rsi_for_stoch, rsi_for_stoch, rsi_for_stoch, stoch_len), stoch_k)
+stoch_rsi_d   = ta.sma(stoch_rsi_k, stoch_d)
+
+// Score 8: Stochastic RSI confirmation
+// CALL: StochRSI above min and K > D (bullish crossover zone)
+// PUT: StochRSI below max and K < D (bearish crossover zone)
+score_stoch_call = stoch_rsi_k > stoch_call_min and stoch_rsi_k > stoch_rsi_d ? 1 : 0
+score_stoch_put  = stoch_rsi_k < stoch_put_max and stoch_rsi_k < stoch_rsi_d ? 1 : 0
+
+// --- Candle Quality ---
+atr_val      = ta.atr(atr_len)
 candle_range = high - low
-candle_body = math.abs(close - open)
-body_ratio = candle_range > 0 ? candle_body / candle_range : 0
-atr_ratio = atr_val > 0 ? candle_range / atr_val : 0
-candle_quality = body_ratio >= min_body_ratio and atr_ratio <= max_atr_multiplier and candle_range > 0
+candle_body  = math.abs(close - open)
+body_ratio   = candle_range > 0 ? candle_body / candle_range : 0
+atr_ratio    = atr_val > 0 ? candle_range / atr_val : 0
+is_bullish_candle = close > open
+is_bearish_candle = close < open
 
-// --- Price Position ---
-price_above_ema = close > ema_fast
-price_below_ema = close < ema_fast
+// Score 9: Quality candle in direction
+score_candle_call = body_ratio >= min_body_ratio and atr_ratio <= max_atr_mult and candle_range > 0 and is_bullish_candle ? 1 : 0
+score_candle_put  = body_ratio >= min_body_ratio and atr_ratio <= max_atr_mult and candle_range > 0 and is_bearish_candle ? 1 : 0
+
+// --- Multi-Timeframe: 1H EMA Trend ---
+ema_1h_fast = request.security(syminfo.tickerid, "60", ta.ema(close, 9))
+ema_1h_slow = request.security(syminfo.tickerid, "60", ta.ema(close, 21))
+ema_1h_trend = request.security(syminfo.tickerid, "60", ta.ema(close, 50))
+
+// Score 10: 1H trend alignment
+score_mtf_call = ema_1h_fast > ema_1h_slow and close > ema_1h_trend ? 1 : 0
+score_mtf_put  = ema_1h_fast < ema_1h_slow and close < ema_1h_trend ? 1 : 0
 
 // =====================================================
-// SIGNAL LOGIC
+// TOTAL SCORE CALCULATION
 // =====================================================
-call_signal = ema_bullish and price_above_ema and rsi_call_ok and st_bullish and adx_ok and candle_quality
-put_signal = ema_bearish and price_below_ema and rsi_put_ok and st_bearish and adx_ok and candle_quality
-new_call = call_signal and not call_signal[1]
-new_put = put_signal and not put_signal[1]
+call_score = score_ema_call + score_trend_call + score_rsi_call + score_macd_call + score_st_call + score_adx_call + score_bb_call + score_stoch_call + score_candle_call + score_mtf_call
+put_score  = score_ema_put  + score_trend_put  + score_rsi_put  + score_macd_put  + score_st_put  + score_adx_put  + score_bb_put  + score_stoch_put  + score_candle_put  + score_mtf_put
+
+// =====================================================
+// SIGNAL LOGIC WITH SCORING
+// =====================================================
+
+// Minimum score filter
+call_signal = call_score >= min_score
+put_signal  = put_score  >= min_score
+
+// Cooldown: no signal within N bars of last signal
+var int bars_since_call = 999
+var int bars_since_put  = 999
+bars_since_call := bars_since_call + 1
+bars_since_put  := bars_since_put  + 1
+
+call_cooled = bars_since_call >= cooldown_bars
+put_cooled  = bars_since_put  >= cooldown_bars
+
+// New signal: score met + first occurrence + cooldown cleared
+new_call = call_signal and not call_signal[1] and call_cooled
+new_put  = put_signal  and not put_signal[1]  and put_cooled
+
+if new_call
+    bars_since_call := 0
+if new_put
+    bars_since_put := 0
+
+// Cancel signals
 call_disappeared = not call_signal and call_signal[1]
-put_disappeared = not put_signal and put_signal[1]
+put_disappeared  = not put_signal  and put_signal[1]
 
+// Target entry time: next 15-min candle open
 next_entry_time = time_close + (15 * 60 * 1000)
 
 // =====================================================
 // PLOTTING
 // =====================================================
-plot(show_ema ? ema_fast : na, "EMA Fast", color=color.new(color.blue, 0), linewidth=2)
-plot(show_ema ? ema_slow : na, "EMA Slow", color=color.new(color.orange, 0), linewidth=2)
+
+// EMAs
+plot(show_ema ? ema_fast  : na, "EMA 9",   color=color.new(color.aqua,   0), linewidth=1)
+plot(show_ema ? ema_mid   : na, "EMA 21",  color=color.new(color.blue,   0), linewidth=2)
+plot(show_ema ? ema_slow  : na, "EMA 50",  color=color.new(color.orange, 0), linewidth=2)
+plot(show_ema ? ema_trend : na, "EMA 200", color=color.new(color.purple, 0), linewidth=3)
+
+// Supertrend
 st_color = st_bullish ? color.new(color.green, 20) : color.new(color.red, 20)
 plot(show_supertrend ? st_line : na, "Supertrend", color=st_color, linewidth=2, style=plot.style_linebr)
-plotshape(show_signals and new_call ? true : false, "CALL Signal", style=shape.triangleup, location=location.belowbar, color=color.new(color.green, 0), size=size.normal, text="CALL")
-plotshape(show_signals and new_put ? true : false, "PUT Signal", style=shape.triangledown, location=location.abovebar, color=color.new(color.red, 0), size=size.normal, text="PUT")
-bgcolor(call_signal ? color.new(color.green, 92) : put_signal ? color.new(color.red, 92) : na)
+
+// Bollinger Bands
+p_bb_upper = plot(show_bb ? bb_upper : na, "BB Upper", color=color.new(color.gray, 60))
+p_bb_lower = plot(show_bb ? bb_lower : na, "BB Lower", color=color.new(color.gray, 60))
+plot(show_bb ? bb_basis : na, "BB Basis", color=color.new(color.gray, 40), linewidth=1)
+fill(p_bb_upper, p_bb_lower, color=color.new(color.gray, 92))
+
+// Signal arrows
+plotshape(show_signals and new_call, "CALL Signal", style=shape.triangleup,   location=location.belowbar, color=color.new(color.green, 0), size=size.normal, text="CALL")
+plotshape(show_signals and new_put,  "PUT Signal",  style=shape.triangledown, location=location.abovebar, color=color.new(color.red, 0),   size=size.normal, text="PUT")
+
+// Background color for active signals
+bgcolor(call_signal ? color.new(color.green, 94) : put_signal ? color.new(color.red, 94) : na)
 
 // =====================================================
-// INFORMATION TABLE
+// SCORE TABLE
 // =====================================================
-var table info_table = table.new(position.top_right, 2, 8, bgcolor=color.new(color.black, 80), border_width=1)
-if barstate.islast
-    table.cell(info_table, 0, 0, "ABOUD TRADING", text_color=color.white, bgcolor=color.new(color.blue, 30), text_size=size.small)
-    table.cell(info_table, 1, 0, "15M BOT", text_color=color.white, bgcolor=color.new(color.blue, 30), text_size=size.small)
-    table.cell(info_table, 0, 1, "EMA Trend", text_color=color.white, text_size=size.tiny)
-    table.cell(info_table, 1, 1, ema_bullish ? "🟢 BULL" : "🔴 BEAR", text_color=ema_bullish ? color.green : color.red, text_size=size.tiny)
-    table.cell(info_table, 0, 2, "RSI", text_color=color.white, text_size=size.tiny)
-    table.cell(info_table, 1, 2, str.tostring(rsi_val, "#.#"), text_color=rsi_val > 50 ? color.green : color.red, text_size=size.tiny)
-    table.cell(info_table, 0, 3, "Supertrend", text_color=color.white, text_size=size.tiny)
-    table.cell(info_table, 1, 3, st_bullish ? "🟢 UP" : "🔴 DOWN", text_color=st_bullish ? color.green : color.red, text_size=size.tiny)
-    table.cell(info_table, 0, 4, "ADX", text_color=color.white, text_size=size.tiny)
-    table.cell(info_table, 1, 4, str.tostring(adx_val, "#.#"), text_color=adx_ok ? color.green : color.gray, text_size=size.tiny)
-    table.cell(info_table, 0, 5, "Signal", text_color=color.white, text_size=size.tiny)
-    signal_text = call_signal ? "🟢 CALL" : put_signal ? "🔴 PUT" : "⚪ NONE"
-    table.cell(info_table, 1, 5, signal_text, text_color=color.white, text_size=size.tiny)
+var table score_table = table.new(position.top_right, 3, 14, bgcolor=color.new(color.black, 80), border_width=1)
+
+if barstate.islast and show_score
+    table.cell(score_table, 0, 0, "ABOUD PRO",   text_color=color.white, bgcolor=color.new(color.blue, 30), text_size=size.small)
+    table.cell(score_table, 1, 0, "CALL",         text_color=color.green, bgcolor=color.new(color.blue, 30), text_size=size.small)
+    table.cell(score_table, 2, 0, "PUT",          text_color=color.red,   bgcolor=color.new(color.blue, 30), text_size=size.small)
+
+    table.cell(score_table, 0, 1, "① EMA Align",  text_color=color.white, text_size=size.tiny)
+    table.cell(score_table, 1, 1, str.tostring(score_ema_call),   text_color=score_ema_call   > 0 ? color.green : color.gray, text_size=size.tiny)
+    table.cell(score_table, 2, 1, str.tostring(score_ema_put),    text_color=score_ema_put    > 0 ? color.green : color.gray, text_size=size.tiny)
+
+    table.cell(score_table, 0, 2, "② EMA 200",    text_color=color.white, text_size=size.tiny)
+    table.cell(score_table, 1, 2, str.tostring(score_trend_call), text_color=score_trend_call > 0 ? color.green : color.gray, text_size=size.tiny)
+    table.cell(score_table, 2, 2, str.tostring(score_trend_put),  text_color=score_trend_put  > 0 ? color.green : color.gray, text_size=size.tiny)
+
+    table.cell(score_table, 0, 3, "③ RSI",         text_color=color.white, text_size=size.tiny)
+    table.cell(score_table, 1, 3, str.tostring(score_rsi_call),   text_color=score_rsi_call   > 0 ? color.green : color.gray, text_size=size.tiny)
+    table.cell(score_table, 2, 3, str.tostring(score_rsi_put),    text_color=score_rsi_put    > 0 ? color.green : color.gray, text_size=size.tiny)
+
+    table.cell(score_table, 0, 4, "④ MACD",        text_color=color.white, text_size=size.tiny)
+    table.cell(score_table, 1, 4, str.tostring(score_macd_call),  text_color=score_macd_call  > 0 ? color.green : color.gray, text_size=size.tiny)
+    table.cell(score_table, 2, 4, str.tostring(score_macd_put),   text_color=score_macd_put   > 0 ? color.green : color.gray, text_size=size.tiny)
+
+    table.cell(score_table, 0, 5, "⑤ Supertrend",  text_color=color.white, text_size=size.tiny)
+    table.cell(score_table, 1, 5, str.tostring(score_st_call),    text_color=score_st_call    > 0 ? color.green : color.gray, text_size=size.tiny)
+    table.cell(score_table, 2, 5, str.tostring(score_st_put),     text_color=score_st_put     > 0 ? color.green : color.gray, text_size=size.tiny)
+
+    table.cell(score_table, 0, 6, "⑥ ADX+DI",      text_color=color.white, text_size=size.tiny)
+    table.cell(score_table, 1, 6, str.tostring(score_adx_call),   text_color=score_adx_call   > 0 ? color.green : color.gray, text_size=size.tiny)
+    table.cell(score_table, 2, 6, str.tostring(score_adx_put),    text_color=score_adx_put    > 0 ? color.green : color.gray, text_size=size.tiny)
+
+    table.cell(score_table, 0, 7, "⑦ Bollinger",   text_color=color.white, text_size=size.tiny)
+    table.cell(score_table, 1, 7, str.tostring(score_bb_call),    text_color=score_bb_call    > 0 ? color.green : color.gray, text_size=size.tiny)
+    table.cell(score_table, 2, 7, str.tostring(score_bb_put),     text_color=score_bb_put     > 0 ? color.green : color.gray, text_size=size.tiny)
+
+    table.cell(score_table, 0, 8, "⑧ StochRSI",    text_color=color.white, text_size=size.tiny)
+    table.cell(score_table, 1, 8, str.tostring(score_stoch_call), text_color=score_stoch_call > 0 ? color.green : color.gray, text_size=size.tiny)
+    table.cell(score_table, 2, 8, str.tostring(score_stoch_put),  text_color=score_stoch_put  > 0 ? color.green : color.gray, text_size=size.tiny)
+
+    table.cell(score_table, 0, 9, "⑨ Candle",      text_color=color.white, text_size=size.tiny)
+    table.cell(score_table, 1, 9, str.tostring(score_candle_call),text_color=score_candle_call> 0 ? color.green : color.gray, text_size=size.tiny)
+    table.cell(score_table, 2, 9, str.tostring(score_candle_put), text_color=score_candle_put > 0 ? color.green : color.gray, text_size=size.tiny)
+
+    table.cell(score_table, 0, 10, "⑩ 1H MTF",     text_color=color.white, text_size=size.tiny)
+    table.cell(score_table, 1, 10, str.tostring(score_mtf_call),  text_color=score_mtf_call   > 0 ? color.green : color.gray, text_size=size.tiny)
+    table.cell(score_table, 2, 10, str.tostring(score_mtf_put),   text_color=score_mtf_put    > 0 ? color.green : color.gray, text_size=size.tiny)
+
+    // Total row
+    table.cell(score_table, 0, 11, "TOTAL",         text_color=color.yellow, bgcolor=color.new(color.blue, 50), text_size=size.small)
+    table.cell(score_table, 1, 11, str.tostring(call_score) + "/10", text_color=call_score >= min_score ? color.green : color.gray, bgcolor=color.new(color.blue, 50), text_size=size.small)
+    table.cell(score_table, 2, 11, str.tostring(put_score) + "/10",  text_color=put_score >= min_score ? color.green : color.gray, bgcolor=color.new(color.blue, 50), text_size=size.small)
+
+    // Signal status
+    signal_text = call_signal ? "🟢 CALL (" + str.tostring(call_score) + ")" : put_signal ? "🔴 PUT (" + str.tostring(put_score) + ")" : "⚪ NONE"
+    table.cell(score_table, 0, 12, "Signal",        text_color=color.white, text_size=size.tiny)
+    table.cell(score_table, 1, 12, signal_text,      text_color=color.white, text_size=size.tiny)
+    table.cell(score_table, 2, 12, "",               text_color=color.white, text_size=size.tiny)
+
+    // RSI + ADX info
+    table.cell(score_table, 0, 13, "RSI/ADX",       text_color=color.white, text_size=size.tiny)
+    table.cell(score_table, 1, 13, str.tostring(rsi_val, "#.#") + " / " + str.tostring(adx_val, "#.#"), text_color=color.white, text_size=size.tiny)
+    table.cell(score_table, 2, 13, "",               text_color=color.white, text_size=size.tiny)
 
 // =====================================================
-// ALERTS
+// ALERTS WITH SIGNAL SCORE
 // =====================================================
 if new_call
-    alert_msg_call = '{"secret":"' + webhook_secret + '","pair":"' + syminfo.ticker + '","direction":"CALL","action":"SIGNAL","target_entry_time":' + str.tostring(next_entry_time) + ',"signal_time":' + str.tostring(time_close) + ',"signal_close":' + str.tostring(close) + ',"indicators":{"ema_fast":' + str.tostring(ema_fast) + ',"ema_slow":' + str.tostring(ema_slow) + ',"rsi":' + str.tostring(rsi_val) + ',"supertrend":"UP","adx":' + str.tostring(adx_val) + '}}'
+    alert_msg_call = '{"secret":"' + webhook_secret + '","pair":"' + syminfo.ticker + '","direction":"CALL","action":"SIGNAL","signal_score":' + str.tostring(call_score) + ',"target_entry_time":' + str.tostring(next_entry_time) + ',"signal_time":' + str.tostring(time_close) + ',"signal_close":' + str.tostring(close) + ',"indicators":{"ema_fast":' + str.tostring(ema_fast) + ',"ema_mid":' + str.tostring(ema_mid) + ',"ema_slow":' + str.tostring(ema_slow) + ',"ema200":' + str.tostring(ema_trend) + ',"rsi":' + str.tostring(rsi_val) + ',"macd_hist":' + str.tostring(hist_val) + ',"supertrend":"UP","adx":' + str.tostring(adx_val) + ',"stoch_k":' + str.tostring(stoch_rsi_k) + ',"bb_basis":' + str.tostring(bb_basis) + '}}'
     alert(alert_msg_call, alert.freq_once_per_bar)
 
 if new_put
-    alert_msg_put = '{"secret":"' + webhook_secret + '","pair":"' + syminfo.ticker + '","direction":"PUT","action":"SIGNAL","target_entry_time":' + str.tostring(next_entry_time) + ',"signal_time":' + str.tostring(time_close) + ',"signal_close":' + str.tostring(close) + ',"indicators":{"ema_fast":' + str.tostring(ema_fast) + ',"ema_slow":' + str.tostring(ema_slow) + ',"rsi":' + str.tostring(rsi_val) + ',"supertrend":"DOWN","adx":' + str.tostring(adx_val) + '}}'
+    alert_msg_put = '{"secret":"' + webhook_secret + '","pair":"' + syminfo.ticker + '","direction":"PUT","action":"SIGNAL","signal_score":' + str.tostring(put_score) + ',"target_entry_time":' + str.tostring(next_entry_time) + ',"signal_time":' + str.tostring(time_close) + ',"signal_close":' + str.tostring(close) + ',"indicators":{"ema_fast":' + str.tostring(ema_fast) + ',"ema_mid":' + str.tostring(ema_mid) + ',"ema_slow":' + str.tostring(ema_slow) + ',"ema200":' + str.tostring(ema_trend) + ',"rsi":' + str.tostring(rsi_val) + ',"macd_hist":' + str.tostring(hist_val) + ',"supertrend":"DOWN","adx":' + str.tostring(adx_val) + ',"stoch_k":' + str.tostring(stoch_rsi_k) + ',"bb_basis":' + str.tostring(bb_basis) + '}}'
     alert(alert_msg_put, alert.freq_once_per_bar)
 
 if call_disappeared
