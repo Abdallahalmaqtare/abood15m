@@ -1,6 +1,8 @@
 """
-Aboud Trading Bot - Main v4 (FINAL)
-Startup message tracked IN DATABASE (PostgreSQL = permanent).
+Aboud Trading Bot - Main v5.0 (UPGRADED)
+==========================================
+Updated pairs: EURUSD + GBPUSD
+Signal scoring system integrated.
 """
 import asyncio, logging, threading, json, time
 from datetime import datetime, timezone
@@ -12,6 +14,7 @@ from config import (
     DAILY_REPORT_HOUR_UTC, DAILY_REPORT_MINUTE,
     SIGNAL_CONFIRM_MIN_SECONDS, SIGNAL_CONFIRM_MAX_SECONDS,
     BOT_UTC_OFFSET, DEBUG, DATABASE_URL,
+    MIN_SIGNAL_SCORE,
 )
 from database import init_db, get_daily_stats, get_today_trades, is_signals_enabled, get_setting, set_setting
 from signal_manager import SignalManager
@@ -34,7 +37,7 @@ loop = None
 
 @app.route("/", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "bot": "v4", "pg": bool(DATABASE_URL)})
+    return jsonify({"status": "ok", "bot": "v5-pro", "pg": bool(DATABASE_URL)})
 
 
 @app.route("/webhook", methods=["POST"])
@@ -118,15 +121,19 @@ async def run_bot():
     await application.updater.start_polling(drop_pending_updates=True)
 
     logger.info("=" * 50)
-    logger.info("  Aboud Trading Bot v4.0 FINAL")
+    logger.info("  Aboud Trading Bot v5.0 PRO")
     logger.info(f"  DB: {'PostgreSQL' if DATABASE_URL else 'SQLite'}")
+    logger.info(f"  Pairs: EURUSD, GBPUSD")
+    logger.info(f"  Min Score: {MIN_SIGNAL_SCORE}/10")
     logger.info("=" * 50)
 
     if _should_send_startup():
         await telegram_sender.send_text(
-            f"🟢 <b>Aboud Trading Bot v4.0</b>\n\n"
-            f"📊 EURUSD, USDJPY, USDCHF\n"
+            f"🟢 <b>Aboud Trading Bot v5.0 PRO</b>\n\n"
+            f"📊 EURUSD, GBPUSD\n"
             f"⏱ 15 min | 🕐 UTC+{BOT_UTC_OFFSET}\n"
+            f"🎯 Min Signal Score: {MIN_SIGNAL_SCORE}/10\n"
+            f"⏰ Trading: 10:00-23:00 (UTC+3)\n"
             f"💾 DB: {'☁️ PostgreSQL' if DATABASE_URL else '📁 SQLite'}\n"
             f"🔄 Active",
         )
