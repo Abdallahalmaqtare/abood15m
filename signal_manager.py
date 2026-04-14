@@ -1,8 +1,12 @@
 """
-Aboud Trading Bot - Signal Manager v3.2
-========================================
-Fixes trade-result analysis by using the exact 15-minute candle OPEN/CLOSE
-from intraday candle data, not delayed spot quotes.
+Aboud Trading Bot - Signal Manager v4.0 (UPGRADED)
+=====================================================
+Major improvements:
+- Signal scoring system (min score 7/10 to send)
+- Faster confirmation (30s-180s instead of 2-10min)
+- Cooldown system per pair (30 min between signals)
+- Better timing: sends signal 1-15 min before entry
+- Trading hours filter (London/NY overlap only)
 """
 import asyncio
 import logging
@@ -20,6 +24,8 @@ from config import (
     RESULT_CANDLE_BUFFER_SECONDS,
     RESULT_FETCH_RETRY_SECONDS,
     RESULT_MAX_WAIT_AFTER_EXPIRY_SECONDS,
+    MIN_SIGNAL_SCORE,
+    SIGNAL_COOLDOWN_MINUTES,
 )
 from database import (
     create_pending_signal,
@@ -45,15 +51,36 @@ class SignalManager:
         self.active_trade = None
         self.active_trade_lock = asyncio.Lock()
         self._last_signal = {}
+        self._last_signal_time = {}  # Cooldown tracker per pair
 
     def is_trading_hours(self):
-        if TRADING_START_HOUR_UTC == 0 and TRADING_END_HOUR_UTC == 24:
-            return True
+        """Check if within London/NY overlap trading hours."""
         now = datetime.now(timezone.utc)
-        return TRADING_START_HOUR_UTC <= now.hour < TRADING_END_HOUR_UTC
+        hour = now.hour
+        weekday = now.weekday()  # 0=Monday, 6=Sunday
+
+        # No trading on weekends
+        if weekday >= 5:
+            logger.info("Weekend - no trading")
+            return False
+
+        return TRADING_START_HOUR_UTC <= hour < TRADING_END_HOUR_UTC
 
     def is_valid_pair(self, pair):
         return pair.upper().replace("/", "") in TRADING_PAIRS
+
+    def is_in_cooldown(self, pair):
+        """Check if pair is in cooldown period."""
+        last_time = self._last_signal_time.get(pair)
+        if last_time is None:
+            return False
+        elapsed = (datetime.now(timezone.utc) - last_time).total_seconds()
+        cooldown_seconds = SIGNAL_COOLDOWN_MINUTES * 60
+        if elapsed < cooldown_seconds:
+            remaining = cooldown_seconds - elapsed
+            logger.info(f"{pair} in cooldown, {remaining:.0f}s remaining")
+            return True
+        return False
 
     def get_next_candle_time(self, now=None):
         now = now or datetime.now(timezone.utc)
@@ -64,6 +91,7 @@ class SignalManager:
         return now.replace(minute=next_slot, second=0, microsecond=0)
 
     def get_target_entry_time_from_payload(self, data):
+        """Parse target entry time from webhook payload."""
         raw = data.get("target_entry_time") or data.get("entry_time") or data.get("entry_timestamp")
         if raw in (None, "", 0):
             return self.get_next_candle_time()
@@ -94,6 +122,26 @@ class SignalManager:
 
         return self.get_next_candle_time()
 
+    def _validate_entry_timing(self, target_entry):
+        """
+        Validate that entry time is reasonable: 1-15 minutes from now.
+        If entry is too far (>15 min), recalculate to next candle.
+        """
+        now = datetime.now(timezone.utc)
+        seconds_until_entry = (target_entry - now).total_seconds()
+
+        # If entry already passed or less than 30s away, skip to next candle
+        if seconds_until_entry < 30:
+            logger.info("Entry time too close or passed, adjusting to next candle")
+            return self.get_next_candle_time(now)
+
+        # If entry is more than 16 minutes away, it's too far
+        if seconds_until_entry > 16 * 60:
+            logger.info(f"Entry time {seconds_until_entry:.0f}s away, too far. Adjusting to next candle.")
+            return self.get_next_candle_time(now)
+
+        return target_entry
+
     def utc_to_local(self, dt):
         return dt.astimezone(BOT_TIMEZONE)
 
@@ -105,8 +153,9 @@ class SignalManager:
         direction = data.get("direction", "").upper()
         action = data.get("action", "SIGNAL").upper()
         indicators = data.get("indicators", {})
+        signal_score = data.get("signal_score", 0)
 
-        logger.info("Webhook: %s %s %s", pair, direction, action)
+        logger.info("Webhook: %s %s %s (score: %s)", pair, direction, action, signal_score)
 
         if not is_signals_enabled():
             return {"status": "disabled"}
@@ -118,12 +167,23 @@ class SignalManager:
             return {"status": "error", "message": f"Invalid direction: {direction}"}
 
         if not self.is_trading_hours():
-            return {"status": "skipped", "message": "Outside trading hours"}
+            return {"status": "skipped", "message": "Outside trading hours (UTC 07:00-20:00)"}
+
+        # Check signal score threshold
+        try:
+            score = float(signal_score)
+        except (TypeError, ValueError):
+            score = 0
+
+        if score < MIN_SIGNAL_SCORE:
+            logger.info("Signal score %.1f < minimum %.1f, REJECTED", score, MIN_SIGNAL_SCORE)
+            return {"status": "rejected", "message": f"Score {score} below minimum {MIN_SIGNAL_SCORE}"}
 
         if action == "SIGNAL":
             self._last_signal[pair] = {
                 "direction": direction,
                 "time": datetime.now(timezone.utc),
+                "score": score,
             }
 
         if action == "CANCEL":
@@ -133,14 +193,20 @@ class SignalManager:
         if self.has_active_trade():
             return {"status": "blocked", "message": "Active trade in progress"}
 
+        if self.is_in_cooldown(pair):
+            return {"status": "cooldown", "message": f"{pair} in cooldown period"}
+
         if pair in self.active_pending and not self.active_pending[pair].done():
             return {"status": "duplicate", "message": f"Pending signal exists for {pair}"}
 
-        return await self._create_temporary_signal(pair, direction, indicators, data)
+        return await self._create_temporary_signal(pair, direction, indicators, data, score)
 
-    async def _create_temporary_signal(self, pair, direction, indicators, payload):
+    async def _create_temporary_signal(self, pair, direction, indicators, payload, score):
         now = datetime.now(timezone.utc)
         target_entry = self.get_target_entry_time_from_payload(payload)
+
+        # Validate and adjust entry timing
+        target_entry = self._validate_entry_timing(target_entry)
 
         signal_id = create_pending_signal(
             pair=pair,
@@ -148,15 +214,17 @@ class SignalManager:
             detected_at=now.isoformat(),
             target_entry_time=target_entry.isoformat(),
             indicator_data=indicators,
+            signal_score=score,
         )
 
         local_entry = self.utc_to_local(target_entry)
         logger.info(
-            "Pending #%s: %s %s (entry %s UTC+3)",
+            "Pending #%s: %s %s (entry %s UTC+3, score: %.1f)",
             signal_id,
             pair,
             direction,
             local_entry.strftime("%H:%M"),
+            score,
         )
 
         if pair in self.active_pending:
@@ -165,12 +233,12 @@ class SignalManager:
                 old_task.cancel()
 
         task = asyncio.create_task(
-            self._smart_confirmation(signal_id, pair, direction, target_entry, indicators)
+            self._smart_confirmation(signal_id, pair, direction, target_entry, indicators, score)
         )
         self.active_pending[pair] = task
-        return {"status": "pending", "signal_id": signal_id}
+        return {"status": "pending", "signal_id": signal_id, "score": score}
 
-    async def _smart_confirmation(self, signal_id, pair, direction, target_entry, indicators):
+    async def _smart_confirmation(self, signal_id, pair, direction, target_entry, indicators, score):
         try:
             elapsed = 0
             confirmed = False
@@ -208,7 +276,10 @@ class SignalManager:
                 return
 
             confirm_pending_signal(signal_id)
-            logger.info("#%s CONFIRMED after %ss: %s %s", signal_id, elapsed, pair, direction)
+            logger.info("#%s CONFIRMED after %ss: %s %s (score: %.1f)", signal_id, elapsed, pair, direction, score)
+
+            # Set cooldown
+            self._last_signal_time[pair] = datetime.now(timezone.utc)
 
             local_entry = self.utc_to_local(target_entry)
             entry_time_str = local_entry.strftime("%H:%M")
@@ -218,6 +289,7 @@ class SignalManager:
                 direction=direction,
                 entry_time=target_entry.isoformat(),
                 entry_price=None,
+                signal_score=score,
             )
 
             async with self.active_trade_lock:
@@ -227,6 +299,7 @@ class SignalManager:
                     "direction": direction,
                     "entry_time": entry_time_str,
                     "target_entry_utc": target_entry,
+                    "score": score,
                 }
 
             stats = get_pair_statistics(pair) or {"total_wins": 0, "total_losses": 0}
@@ -235,8 +308,9 @@ class SignalManager:
                 direction=direction,
                 entry_time=entry_time_str,
                 stats=stats,
+                score=score,
             )
-            logger.info("Signal sent: %s %s at %s", pair, direction, entry_time_str)
+            logger.info("Signal sent: %s %s at %s (score: %.1f)", pair, direction, entry_time_str, score)
 
             result_task = asyncio.create_task(
                 self._monitor_trade(trade_id, pair, direction, entry_time_str, target_entry)
