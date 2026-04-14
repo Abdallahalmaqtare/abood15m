@@ -1,6 +1,7 @@
 """
-Aboud Trading Bot - Database v4 (FINAL)
-==========================================
+Aboud Trading Bot - Database v5 (UPGRADED)
+=============================================
+Updated for EURUSD + GBPUSD only.
 Uses Neon PostgreSQL = DATA NEVER LOST.
 Falls back to SQLite only for local testing.
 """
@@ -78,6 +79,7 @@ def init_db():
             exit_time TEXT,
             exit_price REAL,
             result TEXT,
+            signal_score REAL,
             signal_sent_at TEXT,
             result_sent_at TEXT,
             created_at TIMESTAMP DEFAULT NOW()
@@ -100,6 +102,7 @@ def init_db():
             detected_at TEXT NOT NULL,
             target_entry_time TEXT NOT NULL,
             indicator_data TEXT,
+            signal_score REAL,
             status TEXT DEFAULT 'PENDING',
             created_at TIMESTAMP DEFAULT NOW()
         )""")
@@ -114,6 +117,7 @@ def init_db():
             pair TEXT NOT NULL, direction TEXT NOT NULL,
             entry_time TEXT NOT NULL, entry_price REAL,
             exit_time TEXT, exit_price REAL, result TEXT,
+            signal_score REAL,
             signal_sent_at TEXT, result_sent_at TEXT,
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
         )""")
@@ -128,7 +132,8 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             pair TEXT NOT NULL, direction TEXT NOT NULL,
             detected_at TEXT NOT NULL, target_entry_time TEXT NOT NULL,
-            indicator_data TEXT, status TEXT DEFAULT 'PENDING',
+            indicator_data TEXT, signal_score REAL,
+            status TEXT DEFAULT 'PENDING',
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
         )""")
         c.execute("""CREATE TABLE IF NOT EXISTS settings (
@@ -142,8 +147,8 @@ def init_db():
         else:
             c.execute(f"INSERT OR IGNORE INTO settings (key, value) VALUES ({_PH}, {_PH})", (k, v))
 
-    # Init stats per pair
-    for pair in ["EURUSD", "USDJPY", "USDCHF"]:
+    # Init stats per pair - UPDATED: EURUSD + GBPUSD only
+    for pair in ["EURUSD", "GBPUSD"]:
         if USE_POSTGRES:
             c.execute(f"""INSERT INTO statistics (pair, total_wins, total_losses, daily_wins, daily_losses, last_reset_date)
                          VALUES ({_PH}, 0, 0, 0, 0, {_PH}) ON CONFLICT (pair) DO NOTHING""", (pair, _today_local()))
@@ -184,19 +189,19 @@ def is_signals_enabled():
 
 # ============ TRADES ============
 
-def create_trade(pair, direction, entry_time, entry_price=None):
+def create_trade(pair, direction, entry_time, entry_price=None, signal_score=None):
     conn = get_db()
     c = conn.cursor()
     now = datetime.now(timezone.utc).isoformat()
     if USE_POSTGRES:
         c.execute(
-            f"INSERT INTO trades (pair, direction, entry_time, entry_price, result, signal_sent_at) VALUES ({_PH},{_PH},{_PH},{_PH},'PENDING',{_PH}) RETURNING id",
-            (pair, direction, entry_time, entry_price, now))
+            f"INSERT INTO trades (pair, direction, entry_time, entry_price, result, signal_score, signal_sent_at) VALUES ({_PH},{_PH},{_PH},{_PH},'PENDING',{_PH},{_PH}) RETURNING id",
+            (pair, direction, entry_time, entry_price, signal_score, now))
         tid = c.fetchone()[0]
     else:
         c.execute(
-            f"INSERT INTO trades (pair, direction, entry_time, entry_price, result, signal_sent_at) VALUES ({_PH},{_PH},{_PH},{_PH},'PENDING',{_PH})",
-            (pair, direction, entry_time, entry_price, now))
+            f"INSERT INTO trades (pair, direction, entry_time, entry_price, result, signal_score, signal_sent_at) VALUES ({_PH},{_PH},{_PH},{_PH},'PENDING',{_PH},{_PH})",
+            (pair, direction, entry_time, entry_price, signal_score, now))
         tid = c.lastrowid
     conn.commit()
     conn.close()
@@ -342,17 +347,17 @@ def get_today_trades():
 
 # ============ PENDING SIGNALS ============
 
-def create_pending_signal(pair, direction, detected_at, target_entry_time, indicator_data=None):
+def create_pending_signal(pair, direction, detected_at, target_entry_time, indicator_data=None, signal_score=None):
     conn = get_db()
     c = conn.cursor()
     ind = json.dumps(indicator_data) if indicator_data else None
     if USE_POSTGRES:
-        c.execute(f"INSERT INTO pending_signals (pair, direction, detected_at, target_entry_time, indicator_data, status) VALUES ({_PH},{_PH},{_PH},{_PH},{_PH},'PENDING') RETURNING id",
-                  (pair, direction, detected_at, target_entry_time, ind))
+        c.execute(f"INSERT INTO pending_signals (pair, direction, detected_at, target_entry_time, indicator_data, signal_score, status) VALUES ({_PH},{_PH},{_PH},{_PH},{_PH},{_PH},'PENDING') RETURNING id",
+                  (pair, direction, detected_at, target_entry_time, ind, signal_score))
         sid = c.fetchone()[0]
     else:
-        c.execute(f"INSERT INTO pending_signals (pair, direction, detected_at, target_entry_time, indicator_data, status) VALUES ({_PH},{_PH},{_PH},{_PH},{_PH},'PENDING')",
-                  (pair, direction, detected_at, target_entry_time, ind))
+        c.execute(f"INSERT INTO pending_signals (pair, direction, detected_at, target_entry_time, indicator_data, signal_score, status) VALUES ({_PH},{_PH},{_PH},{_PH},{_PH},{_PH},'PENDING')",
+                  (pair, direction, detected_at, target_entry_time, ind, signal_score))
         sid = c.lastrowid
     conn.commit()
     conn.close()
