@@ -43,8 +43,7 @@ def format_signal_message(pair, direction, entry_time, stats, score=None):
         )
 
     msg = (
-        f"<b>Aboud Trading 15M POCKETOPTION BOT</b> 🔵\n"
-        f"》 ABOUD PRO 15M 《\n\n"
+        f"》 ABOOD TRADING 15M 《\n\n"
         f"📊 <b>{pair}</b>\n"
         f"{de} <b>{direction}</b>\n"
         f"🕐 <b>{entry_time}</b>\n"
