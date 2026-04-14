@@ -1,7 +1,7 @@
 """
-Aboud Trading Bot - Telegram Sender
-======================================
-Handles all Telegram message sending to the channel.
+Aboud Trading Bot - Telegram Sender v4.0
+==========================================
+Updated to pass signal score.
 """
 
 import logging
@@ -58,9 +58,9 @@ class TelegramSender:
             logger.error(f"Failed to send Telegram message: {e}")
             return None
 
-    async def send_signal(self, pair, direction, entry_time, stats):
+    async def send_signal(self, pair, direction, entry_time, stats, score=None):
         """Send a trading signal to the channel."""
-        text = format_signal_message(pair, direction, entry_time, stats)
+        text = format_signal_message(pair, direction, entry_time, stats, score=score)
         return await self._send_message(text)
 
     async def send_result(self, pair, direction, entry_time, result):
