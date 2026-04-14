@@ -1,5 +1,11 @@
 """
-Aboud Trading Bot - Configuration v3.2
+Aboud Trading Bot - Configuration v4.0 (UPGRADED)
+===================================================
+Changes:
+- Removed USDJPY + USDCHF
+- Added GBPUSD as second pair
+- Faster signal confirmation (30-180 seconds)
+- Stricter indicator parameters
 """
 import os
 from datetime import timezone, timedelta
@@ -12,38 +18,54 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 ADMIN_USER_IDS = [int(x) for x in os.getenv("ADMIN_USER_IDS", "").split(",") if x.strip()]
 
 # ============================================
-# TRADING
+# TRADING - UPDATED PAIRS
 # ============================================
-TRADING_PAIRS = ["EURUSD", "USDJPY", "USDCHF"]
+TRADING_PAIRS = ["EURUSD", "GBPUSD"]
 TRADE_DURATION_MINUTES = 15
 
-# Signal confirmation: wait 2-10 minutes
-# The bot checks every 30s if conditions still hold
-SIGNAL_CONFIRM_MIN_SECONDS = 120   # minimum 2 minutes
-SIGNAL_CONFIRM_MAX_SECONDS = 600   # maximum 10 minutes
-SIGNAL_CONFIRM_CHECK_INTERVAL = 30 # re-check every 30 seconds
+# Signal confirmation: FASTER (30s - 180s)
+# The bot checks every 15s if conditions still hold
+SIGNAL_CONFIRM_MIN_SECONDS = 30    # minimum 30 seconds (was 120)
+SIGNAL_CONFIRM_MAX_SECONDS = 180   # maximum 3 minutes (was 600)
+SIGNAL_CONFIRM_CHECK_INTERVAL = 15 # re-check every 15 seconds (was 30)
 
 # Legacy (kept for compatibility)
 SIGNAL_CONFIRM_DELAY_SECONDS = SIGNAL_CONFIRM_MIN_SECONDS
 
 # ============================================
-# INDICATORS
+# INDICATORS - STRICTER PARAMETERS
 # ============================================
-EMA_FAST = 20
+EMA_FAST = 9
+EMA_MID = 21
 EMA_SLOW = 50
+EMA_TREND = 200
 RSI_PERIOD = 14
-RSI_CALL_MIN = 52
-RSI_PUT_MAX = 48
+RSI_CALL_MIN = 55
+RSI_PUT_MAX = 45
 SUPERTREND_PERIOD = 10
-SUPERTREND_MULTIPLIER = 3
+SUPERTREND_MULTIPLIER = 2.0
 ADX_PERIOD = 14
-ADX_MIN_THRESHOLD = 20
+ADX_MIN_THRESHOLD = 25
+MACD_FAST = 12
+MACD_SLOW = 26
+MACD_SIGNAL = 9
 
 # ============================================
-# TRADING HOURS (24/7)
+# SIGNAL SCORING THRESHOLDS
 # ============================================
-TRADING_START_HOUR_UTC = 0
-TRADING_END_HOUR_UTC = 24
+MIN_SIGNAL_SCORE = 7           # Minimum score out of 10 to fire signal
+STRONG_SIGNAL_SCORE = 8        # Score for "strong" signal label
+
+# ============================================
+# TRADING HOURS - London/NY Overlap (best liquidity)
+# ============================================
+TRADING_START_HOUR_UTC = 7     # 07:00 UTC = 10:00 UTC+3
+TRADING_END_HOUR_UTC = 20      # 20:00 UTC = 23:00 UTC+3
+
+# ============================================
+# SIGNAL COOLDOWN
+# ============================================
+SIGNAL_COOLDOWN_MINUTES = 30   # Min time between signals on same pair
 
 # ============================================
 # TIMEZONE UTC+3
