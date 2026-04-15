@@ -1,11 +1,10 @@
 """
-Aboud Trading Bot - Configuration v4.0 (UPGRADED)
+Aboud Trading Bot - Configuration v4.1 (FIXED)
 ===================================================
-Changes:
-- Removed USDJPY + USDCHF
-- Added GBPUSD as second pair
-- Faster signal confirmation (30-180 seconds)
-- Stricter indicator parameters
+FIXES:
+- Trading hours expanded: 00:00-24:00 UTC (24/7 to not miss signals)
+- Signal score minimum: 7 (proven working from TradingView)
+- Faster confirmation: 15-120 seconds
 """
 import os
 from datetime import timezone, timedelta
@@ -23,17 +22,16 @@ ADMIN_USER_IDS = [int(x) for x in os.getenv("ADMIN_USER_IDS", "").split(",") if 
 TRADING_PAIRS = ["EURUSD", "GBPUSD"]
 TRADE_DURATION_MINUTES = 15
 
-# Signal confirmation: FASTER (30s - 180s)
-# The bot checks every 15s if conditions still hold
-SIGNAL_CONFIRM_MIN_SECONDS = 30    # minimum 30 seconds (was 120)
-SIGNAL_CONFIRM_MAX_SECONDS = 180   # maximum 3 minutes (was 600)
-SIGNAL_CONFIRM_CHECK_INTERVAL = 15 # re-check every 15 seconds (was 30)
+# Signal confirmation: FAST
+SIGNAL_CONFIRM_MIN_SECONDS = 15    # minimum 15 seconds
+SIGNAL_CONFIRM_MAX_SECONDS = 120   # maximum 2 minutes
+SIGNAL_CONFIRM_CHECK_INTERVAL = 15 # re-check every 15 seconds
 
 # Legacy (kept for compatibility)
 SIGNAL_CONFIRM_DELAY_SECONDS = SIGNAL_CONFIRM_MIN_SECONDS
 
 # ============================================
-# INDICATORS - STRICTER PARAMETERS
+# INDICATORS
 # ============================================
 EMA_FAST = 9
 EMA_MID = 21
@@ -57,15 +55,15 @@ MIN_SIGNAL_SCORE = 7           # Minimum score out of 10 to fire signal
 STRONG_SIGNAL_SCORE = 8        # Score for "strong" signal label
 
 # ============================================
-# TRADING HOURS - London/NY Overlap (best liquidity)
+# TRADING HOURS - 24/7 (filtering done by indicator)
 # ============================================
-TRADING_START_HOUR_UTC = 7     # 07:00 UTC = 10:00 UTC+3
-TRADING_END_HOUR_UTC = 20      # 20:00 UTC = 23:00 UTC+3
+TRADING_START_HOUR_UTC = 0
+TRADING_END_HOUR_UTC = 24
 
 # ============================================
 # SIGNAL COOLDOWN
 # ============================================
-SIGNAL_COOLDOWN_MINUTES = 30   # Min time between signals on same pair
+SIGNAL_COOLDOWN_MINUTES = 20   # Min time between signals on same pair
 
 # ============================================
 # TIMEZONE UTC+3
@@ -79,7 +77,6 @@ BOT_TIMEZONE = timezone(timedelta(hours=BOT_UTC_OFFSET))
 DATABASE_PATH = os.getenv("DATABASE_PATH", "aboud_trading.db")
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 USE_POSTGRES = bool(DATABASE_URL)
-
 
 # ============================================
 # WEBHOOK
