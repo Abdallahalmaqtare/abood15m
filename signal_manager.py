@@ -1,12 +1,11 @@
 """
-Aboud Trading Bot - Signal Manager v4.0 (UPGRADED)
-=====================================================
-Major improvements:
-- Signal scoring system (min score 7/10 to send)
-- Faster confirmation (30s-180s instead of 2-10min)
-- Cooldown system per pair (30 min between signals)
-- Better timing: sends signal 1-15 min before entry
-- Trading hours filter (London/NY overlap only)
+Aboud Trading Bot - Signal Manager v4.1 (FIXED)
+=================================================
+FIXES:
+- Removed weekend filter (TradingView handles this)
+- Faster confirmation (15s minimum)
+- Better error handling
+- Better logging for debugging
 """
 import asyncio
 import logging
@@ -54,17 +53,11 @@ class SignalManager:
         self._last_signal_time = {}  # Cooldown tracker per pair
 
     def is_trading_hours(self):
-        """Check if within London/NY overlap trading hours."""
+        """Check if within trading hours."""
+        if TRADING_START_HOUR_UTC == 0 and TRADING_END_HOUR_UTC == 24:
+            return True
         now = datetime.now(timezone.utc)
-        hour = now.hour
-        weekday = now.weekday()  # 0=Monday, 6=Sunday
-
-        # No trading on weekends
-        if weekday >= 5:
-            logger.info("Weekend - no trading")
-            return False
-
-        return TRADING_START_HOUR_UTC <= hour < TRADING_END_HOUR_UTC
+        return TRADING_START_HOUR_UTC <= now.hour < TRADING_END_HOUR_UTC
 
     def is_valid_pair(self, pair):
         return pair.upper().replace("/", "") in TRADING_PAIRS
@@ -94,6 +87,7 @@ class SignalManager:
         """Parse target entry time from webhook payload."""
         raw = data.get("target_entry_time") or data.get("entry_time") or data.get("entry_timestamp")
         if raw in (None, "", 0):
+            logger.info("No target_entry_time in payload, using next candle")
             return self.get_next_candle_time()
 
         try:
@@ -102,15 +96,17 @@ class SignalManager:
                 if timestamp > 10_000_000_000:
                     timestamp /= 1000.0
                 dt = datetime.fromtimestamp(timestamp, timezone.utc)
+                logger.info("Parsed entry time from timestamp: %s", dt.isoformat())
                 return dt.replace(second=0, microsecond=0)
 
             if isinstance(raw, str):
                 raw = raw.strip()
-                if raw.isdigit():
+                if raw.replace(".", "").isdigit():
                     timestamp = float(raw)
                     if timestamp > 10_000_000_000:
                         timestamp /= 1000.0
                     dt = datetime.fromtimestamp(timestamp, timezone.utc)
+                    logger.info("Parsed entry time from string timestamp: %s", dt.isoformat())
                     return dt.replace(second=0, microsecond=0)
 
                 dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
@@ -118,27 +114,32 @@ class SignalManager:
                     dt = dt.replace(tzinfo=timezone.utc)
                 return dt.astimezone(timezone.utc).replace(second=0, microsecond=0)
         except Exception as exc:
-            logger.warning("Failed to parse target entry time from payload: %s", exc)
+            logger.warning("Failed to parse target entry time: %s (raw=%s)", exc, raw)
 
         return self.get_next_candle_time()
 
     def _validate_entry_timing(self, target_entry):
         """
-        Validate that entry time is reasonable: 1-15 minutes from now.
-        If entry is too far (>15 min), recalculate to next candle.
+        Validate entry time. Accept anything within 0-20 minutes.
+        If passed, use next candle.
         """
         now = datetime.now(timezone.utc)
         seconds_until_entry = (target_entry - now).total_seconds()
 
-        # If entry already passed or less than 30s away, skip to next candle
-        if seconds_until_entry < 30:
-            logger.info("Entry time too close or passed, adjusting to next candle")
-            return self.get_next_candle_time(now)
+        logger.info("Entry timing: target=%s, now=%s, seconds_until=%s",
+                     target_entry.isoformat(), now.isoformat(), seconds_until_entry)
 
-        # If entry is more than 16 minutes away, it's too far
-        if seconds_until_entry > 16 * 60:
-            logger.info(f"Entry time {seconds_until_entry:.0f}s away, too far. Adjusting to next candle.")
-            return self.get_next_candle_time(now)
+        # If entry already passed, use next candle
+        if seconds_until_entry < -60:
+            new_target = self.get_next_candle_time(now)
+            logger.info("Entry time passed, adjusted to next candle: %s", new_target.isoformat())
+            return new_target
+
+        # If entry is more than 20 minutes away, use next candle
+        if seconds_until_entry > 20 * 60:
+            new_target = self.get_next_candle_time(now)
+            logger.info("Entry too far (%ss), adjusted to next candle: %s", seconds_until_entry, new_target.isoformat())
+            return new_target
 
         return target_entry
 
@@ -149,63 +150,74 @@ class SignalManager:
         return self.active_trade is not None
 
     async def process_webhook_signal(self, data):
-        pair = data.get("pair", "").upper().replace("/", "")
-        direction = data.get("direction", "").upper()
-        action = data.get("action", "SIGNAL").upper()
-        indicators = data.get("indicators", {})
-        signal_score = data.get("signal_score", 0)
-
-        logger.info("Webhook: %s %s %s (score: %s)", pair, direction, action, signal_score)
-
-        if not is_signals_enabled():
-            return {"status": "disabled"}
-
-        if not self.is_valid_pair(pair):
-            return {"status": "error", "message": f"Invalid pair: {pair}"}
-
-        if direction not in ["CALL", "PUT"]:
-            return {"status": "error", "message": f"Invalid direction: {direction}"}
-
-        if not self.is_trading_hours():
-            return {"status": "skipped", "message": "Outside trading hours (UTC 07:00-20:00)"}
-
-        # Check signal score threshold
+        """Process incoming webhook signal. This is the main entry point."""
         try:
-            score = float(signal_score)
-        except (TypeError, ValueError):
-            score = 0
+            pair = data.get("pair", "").upper().replace("/", "").replace("FX:", "").replace("FXCM:", "").replace("OANDA:", "")
+            direction = data.get("direction", "").upper()
+            action = data.get("action", "SIGNAL").upper()
+            signal_score = data.get("signal_score", 0)
 
-        if score < MIN_SIGNAL_SCORE:
-            logger.info("Signal score %.1f < minimum %.1f, REJECTED", score, MIN_SIGNAL_SCORE)
-            return {"status": "rejected", "message": f"Score {score} below minimum {MIN_SIGNAL_SCORE}"}
+            logger.info("Processing: %s %s %s (score: %s)", pair, direction, action, signal_score)
 
-        if action == "SIGNAL":
-            self._last_signal[pair] = {
-                "direction": direction,
-                "time": datetime.now(timezone.utc),
-                "score": score,
-            }
+            if not is_signals_enabled():
+                logger.info("REJECTED: signals disabled")
+                return {"status": "disabled"}
 
-        if action == "CANCEL":
-            self._last_signal.pop(pair, None)
-            return await self._cancel_active_pending(pair)
+            if not self.is_valid_pair(pair):
+                logger.info("REJECTED: invalid pair '%s' (valid: %s)", pair, TRADING_PAIRS)
+                return {"status": "error", "message": f"Invalid pair: {pair}"}
 
-        if self.has_active_trade():
-            return {"status": "blocked", "message": "Active trade in progress"}
+            if direction not in ["CALL", "PUT"]:
+                logger.info("REJECTED: invalid direction '%s'", direction)
+                return {"status": "error", "message": f"Invalid direction: {direction}"}
 
-        if self.is_in_cooldown(pair):
-            return {"status": "cooldown", "message": f"{pair} in cooldown period"}
+            if not self.is_trading_hours():
+                logger.info("REJECTED: outside trading hours")
+                return {"status": "skipped", "message": "Outside trading hours"}
 
-        if pair in self.active_pending and not self.active_pending[pair].done():
-            return {"status": "duplicate", "message": f"Pending signal exists for {pair}"}
+            # Parse score - be lenient
+            try:
+                score = float(signal_score)
+            except (TypeError, ValueError):
+                score = 0
+                logger.warning("Could not parse signal_score: %s, defaulting to 0", signal_score)
 
-        return await self._create_temporary_signal(pair, direction, indicators, data, score)
+            if score < MIN_SIGNAL_SCORE:
+                logger.info("REJECTED: score %.1f < minimum %.1f", score, MIN_SIGNAL_SCORE)
+                return {"status": "rejected", "message": f"Score {score} below minimum {MIN_SIGNAL_SCORE}"}
+
+            if action == "SIGNAL":
+                self._last_signal[pair] = {
+                    "direction": direction,
+                    "time": datetime.now(timezone.utc),
+                    "score": score,
+                }
+
+            if action == "CANCEL":
+                self._last_signal.pop(pair, None)
+                return await self._cancel_active_pending(pair)
+
+            if self.has_active_trade():
+                logger.info("REJECTED: active trade in progress")
+                return {"status": "blocked", "message": "Active trade in progress"}
+
+            if self.is_in_cooldown(pair):
+                return {"status": "cooldown", "message": f"{pair} in cooldown period"}
+
+            if pair in self.active_pending and not self.active_pending[pair].done():
+                logger.info("REJECTED: pending signal already exists for %s", pair)
+                return {"status": "duplicate", "message": f"Pending signal exists for {pair}"}
+
+            logger.info("ACCEPTED: creating signal for %s %s (score: %.1f)", pair, direction, score)
+            return await self._create_temporary_signal(pair, direction, data.get("indicators", {}), data, score)
+
+        except Exception as exc:
+            logger.error("CRASH in process_webhook_signal: %s", exc, exc_info=True)
+            return {"status": "error", "message": str(exc)}
 
     async def _create_temporary_signal(self, pair, direction, indicators, payload, score):
         now = datetime.now(timezone.utc)
         target_entry = self.get_target_entry_time_from_payload(payload)
-
-        # Validate and adjust entry timing
         target_entry = self._validate_entry_timing(target_entry)
 
         signal_id = create_pending_signal(
@@ -220,11 +232,8 @@ class SignalManager:
         local_entry = self.utc_to_local(target_entry)
         logger.info(
             "Pending #%s: %s %s (entry %s UTC+3, score: %.1f)",
-            signal_id,
-            pair,
-            direction,
-            local_entry.strftime("%H:%M"),
-            score,
+            signal_id, pair, direction,
+            local_entry.strftime("%H:%M"), score,
         )
 
         if pair in self.active_pending:
@@ -310,7 +319,7 @@ class SignalManager:
                 stats=stats,
                 score=score,
             )
-            logger.info("Signal sent: %s %s at %s (score: %.1f)", pair, direction, entry_time_str, score)
+            logger.info("✅ Signal SENT to Telegram: %s %s at %s (score: %.1f)", pair, direction, entry_time_str, score)
 
             result_task = asyncio.create_task(
                 self._monitor_trade(trade_id, pair, direction, entry_time_str, target_entry)
@@ -361,7 +370,6 @@ class SignalManager:
 
             await asyncio.sleep(RESULT_CANDLE_BUFFER_SECONDS)
 
-            # Save entry open from the exact 15m candle if already available.
             entry_open = await price_service.get_candle_open(pair, target_entry)
             if entry_open is not None:
                 update_trade_entry_price(trade_id, entry_open)
@@ -384,19 +392,12 @@ class SignalManager:
                 update_trade_entry_price(trade_id, entry_price)
                 result = self._determine_result(direction, entry_price, exit_price)
                 logger.info(
-                    "Trade #%s: reliable candle result via %s (%s) | entry=%s exit=%s => %s",
-                    trade_id,
-                    candle.get("source"),
-                    candle.get("consensus"),
-                    entry_price,
-                    exit_price,
-                    result,
+                    "Trade #%s: candle result via %s (%s) | entry=%s exit=%s => %s",
+                    trade_id, candle.get("source"), candle.get("consensus"),
+                    entry_price, exit_price, result,
                 )
             else:
-                logger.warning(
-                    "Trade #%s: exact 15m candle unavailable after retries. Falling back to current spot quote.",
-                    trade_id,
-                )
+                logger.warning("Trade #%s: candle unavailable, falling back to spot", trade_id)
                 entry_price = await price_service.get_candle_open(pair, target_entry)
                 exit_price = await price_service.get_price(pair)
                 if entry_price is None or exit_price is None:
@@ -415,13 +416,7 @@ class SignalManager:
                 result=result,
             )
 
-            logger.info(
-                "Trade #%s completed: %s (entry=%s, exit=%s)",
-                trade_id,
-                result,
-                entry_price,
-                exit_price,
-            )
+            logger.info("Trade #%s completed: %s (entry=%s, exit=%s)", trade_id, result, entry_price, exit_price)
 
         except Exception as exc:
             logger.error("Error in trade #%s: %s", trade_id, exc, exc_info=True)
