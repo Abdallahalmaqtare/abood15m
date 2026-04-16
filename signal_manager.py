@@ -1,6 +1,12 @@
 """
-Signal Manager - Aboud Trading Bot v5.0 PRO
-Handles signal reception, validation, confirmation, and trade monitoring.
+Aboud Trading Bot - Signal Manager v5.2
+======================================
+Fixes:
+- Restored compatibility with main.py / admin_bot.py
+- Accepts both pair/ticker and entry_time/target_entry_time payload formats
+- Uses current telegram_sender signatures correctly
+- Uses price_service API correctly for candle open/result
+- Supports signals_enabled setting and active trade state
 """
 
 import asyncio
@@ -12,12 +18,11 @@ from config import (
     TRADE_DURATION_MINUTES,
     SIGNAL_CONFIRM_MIN_SECONDS,
     SIGNAL_CONFIRM_MAX_SECONDS,
-    WEBHOOK_SECRET,
-    BOT_UTC_OFFSET,
     MIN_SIGNAL_SCORE,
-    TRADING_HOUR_START,
-    TRADING_HOUR_END,
-    COOLDOWN_MINUTES,
+    TRADING_START_HOUR_UTC,
+    TRADING_END_HOUR_UTC,
+    SIGNAL_COOLDOWN_MINUTES,
+    WEBHOOK_SECRET,
 )
 from database import (
     create_pending_signal,
@@ -26,205 +31,168 @@ from database import (
     create_trade,
     update_trade,
     update_statistics,
+    get_statistics,
+    is_signals_enabled,
 )
-from price_service import PriceService
-from telegram_sender import TelegramSender
+from price_service import price_service as default_price_service
 
 logger = logging.getLogger(__name__)
 
 
 class SignalManager:
-    """Manages the lifecycle of trading signals from reception to result."""
+    """Receives, validates, sends, and tracks trading signals."""
 
-    def __init__(self, telegram_sender: TelegramSender, price_service: PriceService):
+    def __init__(self, telegram_sender, price_service=None):
         self.telegram_sender = telegram_sender
-        self.price_service = price_service
-        self.active_signals = {}  # pair -> last_signal_time (for cooldown)
+        self.price_service = price_service or default_price_service
+        self.active_signals = {}           # pair -> last signal UTC datetime
+        self.active_trade = None           # used by admin_bot manual close helper
+        self.active_trade_lock = asyncio.Lock()
         self._processing_lock = asyncio.Lock()
 
-    # ─────────────────────────────────────────────
-    #  WEBHOOK ENTRY POINT
-    # ─────────────────────────────────────────────
+    # Compatibility alias expected by main.py
+    async def process_webhook_signal(self, data: dict) -> dict:
+        return await self.handle_webhook(data)
 
     async def handle_webhook(self, data: dict) -> dict:
-        """
-        Handle incoming webhook from TradingView.
-        Returns a status dict for the HTTP response.
-        """
-        # ── Validate secret ──
         secret = data.get("secret", "")
-        if secret != WEBHOOK_SECRET:
-            logger.warning("🚫 Invalid webhook secret received")
+        if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
+            logger.warning("🚫 Invalid webhook secret")
             return {"status": "error", "message": "Invalid secret"}
 
-        action = data.get("action", "").upper()
-
-        # ── Handle CANCEL signals ──
+        action = str(data.get("action", "SIGNAL")).upper()
         if action == "CANCEL":
-            pair = data.get("ticker", "")
-            logger.info("🚫 CANCEL signal received for %s — ignored (immediate mode)", pair)
-            return {"status": "ignored", "message": "Cancel signals ignored in immediate mode"}
+            pair = data.get("ticker") or data.get("pair") or ""
+            logger.info("🚫 Cancel signal ignored in immediate mode for %s", pair)
+            return {"status": "ignored", "message": "Cancel ignored in immediate mode"}
 
-        # ── Process trading signal ──
         return await self.process_signal(data)
 
-    # ─────────────────────────────────────────────
-    #  SIGNAL PROCESSING
-    # ─────────────────────────────────────────────
-
     async def process_signal(self, signal_data: dict) -> dict:
-        """Validate, persist and dispatch a new trading signal."""
-        pair = signal_data.get("ticker", "").upper().replace("/", "")
-        direction = signal_data.get("direction", "").upper()
-        signal_time = signal_data.get("signal_time", "")
-        entry_time = signal_data.get("target_entry_time", "")
-        signal_score = 0
+        async with self._processing_lock:
+            pair = (signal_data.get("ticker") or signal_data.get("pair") or "").upper().replace("/", "")
+            direction = str(signal_data.get("direction", "")).upper()
+            signal_time = signal_data.get("signal_time") or datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            entry_time = signal_data.get("target_entry_time") or signal_data.get("entry_time")
 
-        # Safely parse signal_score from webhook payload
-        try:
-            signal_score = int(signal_data.get("signal_score", 0) or 0)
-        except (ValueError, TypeError):
-            signal_score = 0
+            try:
+                signal_score = int(float(signal_data.get("signal_score", 0) or 0))
+            except (ValueError, TypeError):
+                signal_score = 0
 
-        logger.info(
-            "📨 Signal received: %s %s | score=%s/10 | signal_time=%s | entry_time=%s",
-            pair, direction, signal_score, signal_time, entry_time,
-        )
-
-        # ── Validate pair ──
-        if pair not in TRADING_PAIRS:
-            logger.warning("⛔ Pair %s not in allowed list %s", pair, TRADING_PAIRS)
-            return {"status": "rejected", "message": f"Pair {pair} not allowed"}
-
-        # ── Validate direction ──
-        if direction not in ("CALL", "PUT"):
-            logger.warning("⛔ Invalid direction: %s", direction)
-            return {"status": "rejected", "message": f"Invalid direction: {direction}"}
-
-        # ── Validate minimum score ──
-        if signal_score < MIN_SIGNAL_SCORE:
             logger.info(
-                "⛔ Signal score %s < minimum %s — rejected", signal_score, MIN_SIGNAL_SCORE
+                "📨 Signal received: pair=%s direction=%s score=%s entry=%s",
+                pair, direction, signal_score, entry_time,
             )
-            return {
-                "status": "rejected",
-                "message": f"Score {signal_score} below minimum {MIN_SIGNAL_SCORE}",
+
+            if not is_signals_enabled():
+                logger.info("⛔ Signals are disabled from admin setting")
+                return {"status": "rejected", "message": "Signals disabled"}
+
+            if pair not in TRADING_PAIRS:
+                return {"status": "rejected", "message": f"Pair {pair} not allowed"}
+
+            if direction not in ("CALL", "PUT"):
+                return {"status": "rejected", "message": f"Invalid direction {direction}"}
+
+            if signal_score < MIN_SIGNAL_SCORE:
+                return {
+                    "status": "rejected",
+                    "message": f"Score {signal_score} below minimum {MIN_SIGNAL_SCORE}",
+                }
+
+            if not self._is_trading_hours():
+                return {"status": "rejected", "message": "Outside trading hours"}
+
+            now_utc = datetime.now(timezone.utc)
+            if now_utc.weekday() >= 5:
+                return {"status": "rejected", "message": "Weekend"}
+
+            if not self._check_cooldown(pair):
+                return {"status": "rejected", "message": f"Cooldown active for {pair}"}
+
+            timing_ok, minutes_until, normalized_entry_time = self._validate_entry_timing(entry_time)
+            if not timing_ok:
+                return {
+                    "status": "rejected",
+                    "message": f"Invalid entry timing ({minutes_until:.1f} min)",
+                }
+
+            try:
+                pending_id = create_pending_signal(
+                    pair=pair,
+                    direction=direction,
+                    signal_time=signal_time,
+                    entry_time=normalized_entry_time,
+                    status="ACCEPTED",
+                    signal_score=signal_score,
+                )
+            except Exception as e:
+                logger.exception("❌ Failed to save pending signal: %s", e)
+                return {"status": "error", "message": f"Database error: {e}"}
+
+            self.active_signals[pair] = datetime.now(timezone.utc)
+
+            # Build stats in the structure expected by messages.py/telegram_sender.py
+            pair_stats = get_statistics(pair) or {}
+            send_stats = {
+                "total_wins": int(pair_stats.get("total_wins", 0)),
+                "total_losses": int(pair_stats.get("total_losses", 0)),
             }
 
-        # ── Check trading hours ──
-        if not self._is_trading_hours():
-            logger.info("⛔ Outside trading hours (%02d:00-%02d:00 UTC)", TRADING_HOUR_START, TRADING_HOUR_END)
-            return {"status": "rejected", "message": "Outside trading hours"}
+            try:
+                await self.telegram_sender.send_signal(
+                    pair,
+                    direction,
+                    normalized_entry_time,
+                    send_stats,
+                    score=signal_score,
+                )
+                logger.info("📤 Telegram signal sent: %s %s", pair, direction)
+            except Exception as e:
+                logger.exception("❌ Telegram send_signal failed: %s", e)
 
-        # ── Check weekend ──
-        now_utc = datetime.now(timezone.utc)
-        if now_utc.weekday() >= 5:  # Saturday=5, Sunday=6
-            logger.info("⛔ Weekend — no trading")
-            return {"status": "rejected", "message": "Weekend — market closed"}
+            asyncio.create_task(
+                self._monitor_trade(
+                    pending_id=pending_id,
+                    pair=pair,
+                    direction=direction,
+                    entry_time=normalized_entry_time,
+                    signal_score=signal_score,
+                )
+            )
 
-        # ── Cooldown check ──
-        if not self._check_cooldown(pair):
-            logger.info("⛔ Cooldown active for %s", pair)
-            return {"status": "rejected", "message": f"Cooldown active for {pair}"}
-
-        # ── Validate entry timing ──
-        timing_ok, minutes_until = self._validate_entry_timing(entry_time)
-        if not timing_ok:
-            logger.info("⛔ Bad entry timing: %.1f min until entry", minutes_until)
             return {
-                "status": "rejected",
-                "message": f"Entry timing invalid ({minutes_until:.1f} min)",
+                "status": "accepted",
+                "message": f"Signal accepted: {pair} {direction} ({signal_score}/10)",
+                "pending_id": pending_id,
             }
-
-        logger.info("✅ Signal ACCEPTED: %s %s | score=%s | entry in %.1f min",
-                     pair, direction, signal_score, minutes_until)
-
-        # ── Persist pending signal ──
-        try:
-            pending_id = create_pending_signal(
-                pair=pair,
-                direction=direction,
-                signal_time=signal_time,
-                entry_time=entry_time,
-                status="ACCEPTED",
-                signal_score=signal_score,
-            )
-        except Exception as e:
-            logger.exception("❌ DB error saving pending signal: %s", e)
-            return {"status": "error", "message": f"Database error: {e}"}
-
-        # ── Update cooldown ──
-        self.active_signals[pair] = datetime.now(timezone.utc)
-
-        # ── Send Telegram alert ──
-        try:
-            await self.telegram_sender.send_signal(
-                pair=pair,
-                direction=direction,
-                entry_time=entry_time,
-                signal_score=signal_score,
-            )
-            logger.info("📤 Telegram signal sent for %s %s", pair, direction)
-        except Exception as e:
-            logger.exception("❌ Telegram send failed: %s", e)
-
-        # ── Launch trade monitor in background ──
-        asyncio.create_task(
-            self._monitor_trade(
-                pending_id=pending_id,
-                pair=pair,
-                direction=direction,
-                entry_time=entry_time,
-                signal_score=signal_score,
-            )
-        )
-
-        return {
-            "status": "accepted",
-            "message": f"Signal accepted: {pair} {direction} (score {signal_score}/10)",
-            "pending_id": pending_id,
-        }
-
-    # ─────────────────────────────────────────────
-    #  TRADE MONITORING
-    # ─────────────────────────────────────────────
 
     async def _monitor_trade(self, pending_id, pair, direction, entry_time, signal_score=0):
-        """
-        Wait until entry candle, record open price, wait for expiry,
-        fetch result candle, determine WIN/LOSS, update DB & Telegram.
-        """
         try:
-            # ── Parse entry time ──
             entry_dt = self._parse_entry_time(entry_time)
             if not entry_dt:
-                logger.error("❌ Cannot parse entry_time: %s", entry_time)
+                logger.error("❌ Cannot parse entry time: %s", entry_time)
                 delete_pending_signal(pending_id)
                 return
 
-            now = datetime.now(timezone.utc)
-            wait_seconds = (entry_dt - now).total_seconds()
-
+            wait_seconds = (entry_dt - datetime.now(timezone.utc)).total_seconds()
             if wait_seconds > 0:
-                logger.info("⏳ Waiting %.0f sec until entry for %s %s", wait_seconds, pair, direction)
+                logger.info("⏳ Waiting %.1f seconds for entry %s %s", wait_seconds, pair, direction)
                 await asyncio.sleep(wait_seconds)
 
-            # ── Small buffer to let candle form ──
-            await asyncio.sleep(5)
+            # let the new candle form
+            await asyncio.sleep(2)
 
-            # ── Get entry (open) price ──
-            entry_price = await self.price_service.get_candle_open(pair)
-            if entry_price is None:
-                logger.warning("⚠️ Could not get entry price for %s, trying spot", pair)
+            candle = await self.price_service.get_trade_candle(pair, entry_dt)
+            if candle:
+                entry_price = candle.get("entry_price")
+            else:
                 entry_price = await self.price_service.get_price(pair)
 
-            logger.info("📍 Entry price for %s: %s", pair, entry_price)
-
-            # ── Calculate expiry ──
             expiry_dt = entry_dt + timedelta(minutes=TRADE_DURATION_MINUTES)
             expiry_time = expiry_dt.strftime("%Y-%m-%d %H:%M:%S")
 
-            # ── Create trade record ──
             try:
                 trade_id = create_trade(
                     pair=pair,
@@ -235,142 +203,140 @@ class SignalManager:
                     signal_score=signal_score,
                 )
             except Exception as e:
-                logger.exception("❌ DB error creating trade: %s", e)
+                logger.exception("❌ Failed to create trade: %s", e)
                 delete_pending_signal(pending_id)
                 return
 
-            # Update with entry price
             if entry_price is not None:
                 update_trade(trade_id, entry_price=entry_price)
 
-            # ── Mark pending signal as active ──
             update_pending_signal(pending_id, "ACTIVE")
 
-            # ── Wait for trade to expire ──
-            now = datetime.now(timezone.utc)
-            remaining = (expiry_dt - now).total_seconds()
+            async with self.active_trade_lock:
+                self.active_trade = {
+                    "id": trade_id,
+                    "pair": pair,
+                    "direction": direction,
+                    "entry_time": entry_time,
+                    "expiry_time": expiry_time,
+                    "entry_price": entry_price,
+                    "signal_score": signal_score,
+                }
+
+            remaining = (expiry_dt - datetime.now(timezone.utc)).total_seconds()
             if remaining > 0:
-                logger.info("⏳ Trade %s active, waiting %.0f sec for expiry", trade_id, remaining)
+                logger.info("⏳ Trade active for %.1f seconds: #%s", remaining, trade_id)
                 await asyncio.sleep(remaining)
 
-            # ── Small buffer for candle close ──
-            await asyncio.sleep(10)
+            # wait a few seconds for candle source to finalize close price
+            await asyncio.sleep(6)
 
-            # ── Get exit price ──
-            exit_price = await self.price_service.get_trade_candle(pair, entry_time)
+            result_candle = await self.price_service.get_trade_candle(pair, entry_dt)
+            exit_price = result_candle.get("exit_price") if result_candle else None
             if exit_price is None:
                 exit_price = await self.price_service.get_price(pair)
 
-            logger.info("🏁 Exit price for %s: %s", pair, exit_price)
+            result = self._determine_result(direction, entry_price, exit_price)
+            logger.info(
+                "📊 Trade completed: %s %s result=%s entry=%s exit=%s",
+                pair, direction, result, entry_price, exit_price,
+            )
 
-            # ── Determine result ──
-            if entry_price is not None and exit_price is not None:
-                if direction == "CALL":
-                    result = "WIN" if exit_price > entry_price else ("LOSS" if exit_price < entry_price else "DRAW")
-                else:  # PUT
-                    result = "WIN" if exit_price < entry_price else ("LOSS" if exit_price > entry_price else "DRAW")
-            else:
-                result = "DRAW"
-                logger.warning("⚠️ Missing prices, marking as DRAW")
-
-            logger.info("📊 Trade result: %s %s → %s (entry=%.5f, exit=%.5f)",
-                        pair, direction, result,
-                        entry_price or 0, exit_price or 0)
-
-            # ── Update trade record ──
             update_trade(
                 trade_id,
                 exit_price=exit_price,
                 status="COMPLETED",
                 result=result,
             )
-
-            # ── Update statistics ──
             update_statistics(pair, result)
-
-            # ── Mark pending signal done ──
             update_pending_signal(pending_id, "COMPLETED")
 
-            # ── Send result to Telegram ──
             try:
-                await self.telegram_sender.send_result(
-                    pair=pair,
-                    direction=direction,
-                    result=result,
-                    entry_price=entry_price,
-                    exit_price=exit_price,
-                )
+                await self.telegram_sender.send_result(pair, direction, entry_time, result)
             except Exception as e:
-                logger.exception("❌ Telegram result send failed: %s", e)
+                logger.exception("❌ Telegram send_result failed: %s", e)
+
+            async with self.active_trade_lock:
+                self.active_trade = None
 
         except asyncio.CancelledError:
-            logger.info("🚫 Trade monitor cancelled for %s", pair)
+            logger.info("Trade monitor cancelled for %s", pair)
         except Exception as e:
             logger.exception("❌ Trade monitor error for %s: %s", pair, e)
+            async with self.active_trade_lock:
+                self.active_trade = None
 
-    # ─────────────────────────────────────────────
-    #  VALIDATION HELPERS
-    # ─────────────────────────────────────────────
+    def _determine_result(self, direction, entry_price, exit_price):
+        if entry_price is None or exit_price is None:
+            return "DRAW"
+        if direction == "CALL":
+            if exit_price > entry_price:
+                return "WIN"
+            if exit_price < entry_price:
+                return "LOSS"
+            return "DRAW"
+        if exit_price < entry_price:
+            return "WIN"
+        if exit_price > entry_price:
+            return "LOSS"
+        return "DRAW"
 
     def _is_trading_hours(self) -> bool:
-        """Check if current UTC hour is within allowed trading window."""
-        now_utc = datetime.now(timezone.utc)
-        hour = now_utc.hour
-        return TRADING_HOUR_START <= hour < TRADING_HOUR_END
+        hour = datetime.now(timezone.utc).hour
+        if TRADING_START_HOUR_UTC <= TRADING_END_HOUR_UTC:
+            return TRADING_START_HOUR_UTC <= hour < TRADING_END_HOUR_UTC
+        return hour >= TRADING_START_HOUR_UTC or hour < TRADING_END_HOUR_UTC
 
     def _check_cooldown(self, pair: str) -> bool:
-        """Check if enough time has passed since last signal for this pair."""
         last_time = self.active_signals.get(pair)
-        if last_time is None:
+        if not last_time:
             return True
         elapsed = (datetime.now(timezone.utc) - last_time).total_seconds()
-        return elapsed >= (COOLDOWN_MINUTES * 60)
+        return elapsed >= (SIGNAL_COOLDOWN_MINUTES * 60)
 
     def _validate_entry_timing(self, entry_time_str: str):
-        """
-        Validate that entry time is between 0.5 and 16 minutes from now.
-        Returns (is_valid, minutes_until_entry).
-        """
+        """Return (valid, minutes_until, normalized_entry_time_str)."""
         entry_dt = self._parse_entry_time(entry_time_str)
         if not entry_dt:
-            return False, -1
+            return False, -1, entry_time_str
 
-        now = datetime.now(timezone.utc)
-        diff = (entry_dt - now).total_seconds()
+        diff = (entry_dt - datetime.now(timezone.utc)).total_seconds()
         minutes_until = diff / 60.0
 
-        # Accept signals 30 sec to 16 min before entry
-        is_valid = (SIGNAL_CONFIRM_MIN_SECONDS <= diff <= SIGNAL_CONFIRM_MAX_SECONDS + 360)
-        return is_valid, minutes_until
+        # In immediate mode config is 0/0, so accept from ~now up to 16 minutes.
+        min_seconds = SIGNAL_CONFIRM_MIN_SECONDS if SIGNAL_CONFIRM_MIN_SECONDS > 0 else -60
+        max_seconds = SIGNAL_CONFIRM_MAX_SECONDS if SIGNAL_CONFIRM_MAX_SECONDS > 0 else 960
 
-    def _parse_entry_time(self, entry_time_str: str):
-        """Parse entry time string into a timezone-aware datetime."""
-        if not entry_time_str:
+        valid = min_seconds <= diff <= max_seconds
+        normalized = entry_dt.strftime("%Y-%m-%d %H:%M:%S")
+        return valid, minutes_until, normalized
+
+    def _parse_entry_time(self, value):
+        if not value:
             return None
+        if isinstance(value, datetime):
+            return value.astimezone(timezone.utc) if value.tzinfo else value.replace(tzinfo=timezone.utc)
 
+        try:
+            ts = int(str(value))
+            if ts > 1_000_000_000_000:
+                ts = ts / 1000
+            return datetime.fromtimestamp(ts, tz=timezone.utc)
+        except (ValueError, TypeError, OSError):
+            pass
+
+        text = str(value).strip()
         formats = [
             "%Y-%m-%d %H:%M:%S",
             "%Y-%m-%dT%H:%M:%S",
             "%Y-%m-%d %H:%M",
             "%Y-%m-%dT%H:%M",
         ]
-
-        # Handle Unix timestamp (milliseconds)
-        try:
-            ts = int(entry_time_str)
-            if ts > 1e12:
-                ts = ts / 1000  # Convert ms to seconds
-            return datetime.fromtimestamp(ts, tz=timezone.utc)
-        except (ValueError, TypeError, OSError):
-            pass
-
-        # Try string formats
         for fmt in formats:
             try:
-                dt = datetime.strptime(entry_time_str, fmt)
-                return dt.replace(tzinfo=timezone.utc)
+                return datetime.strptime(text, fmt).replace(tzinfo=timezone.utc)
             except ValueError:
                 continue
 
-        logger.warning("⚠️ Could not parse entry time: %s", entry_time_str)
+        logger.warning("⚠️ Could not parse entry time: %s", value)
         return None
