@@ -1,9 +1,13 @@
 """
-Aboud Trading Bot - Database Layer v5.2
+Aboud Trading Bot - Database Layer v5.3
 ======================================
 Fixes:
+- CRITICAL FIX: Full auto-migration for ALL expected columns
+  (signal_time, entry_time, expiry_time, entry_price, exit_price,
+   status, result, profit_loss, signal_score) in both pending_signals
+   and trades tables. Solves the error:
+   "column \"signal_time\" of relation \"pending_signals\" does not exist"
 - Restored legacy helper functions required by main.py and admin_bot.py
-- Added auto-migration for signal_score column
 - Normalized returned rows to dict objects for PostgreSQL and SQLite
 - Added daily stats / today trades / signals enabled helpers
 """
@@ -68,21 +72,35 @@ def _table_info_sql(table_name: str):
     return (f"PRAGMA table_info({table_name})", ())
 
 
-def _ensure_column(conn, table_name: str, column_name: str, definition_sql: str):
-    """Auto-add missing columns in existing deployments."""
+def _get_existing_columns(conn, table_name: str):
+    """Return a set of existing column names for the given table."""
     cur = conn.cursor()
     try:
         sql, params = _table_info_sql(table_name)
         cur.execute(sql, params)
         rows = cur.fetchall()
         if USE_POSTGRES:
-            existing = {r["column_name"] if isinstance(r, dict) else r[0] for r in rows}
-        else:
-            existing = {r[1] for r in rows}
+            return {r["column_name"] if isinstance(r, dict) else r[0] for r in rows}
+        return {r[1] for r in rows}
+    except Exception as e:
+        logger.warning("Could not list columns of %s: %s", table_name, e)
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return set()
 
+
+def _ensure_column(conn, table_name: str, column_name: str, definition_sql: str):
+    """Auto-add a missing column in existing deployments."""
+    cur = conn.cursor()
+    try:
+        existing = _get_existing_columns(conn, table_name)
         if column_name not in existing:
-            logger.info("Adding missing column %s.%s", table_name, column_name)
-            cur.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {definition_sql}")
+            logger.info("🛠️  Adding missing column %s.%s", table_name, column_name)
+            cur.execute(
+                f"ALTER TABLE {table_name} ADD COLUMN {column_name} {definition_sql}"
+            )
             conn.commit()
     except Exception as e:
         logger.warning("Could not ensure column %s.%s: %s", table_name, column_name, e)
@@ -90,6 +108,47 @@ def _ensure_column(conn, table_name: str, column_name: str, definition_sql: str)
             conn.rollback()
         except Exception:
             pass
+
+
+def _ensure_all_columns(conn, table_name: str, columns: dict):
+    """Ensure every expected column exists. columns = {name: definition_sql}."""
+    for name, definition in columns.items():
+        _ensure_column(conn, table_name, name, definition)
+
+
+# ═══════════════════════════════════════════════
+# EXPECTED COLUMNS (used by auto-migration)
+# ═══════════════════════════════════════════════
+_PG_NUM = "DOUBLE PRECISION"
+_SL_NUM = "REAL"
+
+def _trades_expected_columns():
+    num = _PG_NUM if USE_POSTGRES else _SL_NUM
+    return {
+        "pair": "TEXT",
+        "direction": "TEXT",
+        "entry_time": "TEXT",
+        "expiry_time": "TEXT",
+        "entry_price": num,
+        "exit_price": num,
+        "status": "TEXT DEFAULT 'ACTIVE'",
+        "result": "TEXT",
+        "profit_loss": f"{num} DEFAULT 0",
+        "signal_score": "INTEGER DEFAULT 0",
+        "created_at": "TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+    }
+
+
+def _pending_signals_expected_columns():
+    return {
+        "pair": "TEXT",
+        "direction": "TEXT",
+        "signal_time": "TEXT",
+        "entry_time": "TEXT",
+        "status": "TEXT DEFAULT 'PENDING'",
+        "signal_score": "INTEGER DEFAULT 0",
+        "created_at": "TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+    }
 
 
 def _create_tables(cur):
@@ -216,21 +275,29 @@ def _create_tables(cur):
 
 
 def init_db():
-    """Create tables + migrate old DBs."""
+    """Create tables + migrate old DBs (idempotent)."""
     conn = get_db_connection()
     cur = conn.cursor()
     try:
         _create_tables(cur)
         conn.commit()
 
-        _ensure_column(conn, "trades", "signal_score", "INTEGER DEFAULT 0")
-        _ensure_column(conn, "pending_signals", "signal_score", "INTEGER DEFAULT 0")
+        # ─── FULL AUTO-MIGRATION for old deployments ──────────
+        # Make sure every column expected by the current code exists.
+        # Handles old Render databases where new columns were never created.
+        _ensure_all_columns(conn, "trades", _trades_expected_columns())
+        _ensure_all_columns(conn, "pending_signals", _pending_signals_expected_columns())
 
-        # Backfill old NULL rows
-        cur.execute("UPDATE trades SET signal_score = 0 WHERE signal_score IS NULL")
-        cur.execute("UPDATE pending_signals SET signal_score = 0 WHERE signal_score IS NULL")
-        conn.commit()
+        # Backfill NULL rows
+        try:
+            cur.execute("UPDATE trades SET signal_score = 0 WHERE signal_score IS NULL")
+            cur.execute("UPDATE pending_signals SET signal_score = 0 WHERE signal_score IS NULL")
+            conn.commit()
+        except Exception as e:
+            logger.warning("Backfill skipped: %s", e)
+            conn.rollback()
 
+        # Initial statistics rows
         from config import TRADING_PAIRS
         for pair in TRADING_PAIRS:
             if USE_POSTGRES:
@@ -246,7 +313,7 @@ def init_db():
         if get_setting("signals_enabled", None) is None:
             set_setting("signals_enabled", "true")
 
-        logger.info("✅ Database initialized successfully")
+        logger.info("✅ Database initialized & migrated successfully")
     except Exception as e:
         logger.error("❌ Database initialization failed: %s", e, exc_info=True)
         conn.rollback()
