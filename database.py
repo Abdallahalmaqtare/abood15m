@@ -1,15 +1,23 @@
 """
-Aboud Trading Bot - Database Layer v5.3
-======================================
-Fixes:
-- CRITICAL FIX: Full auto-migration for ALL expected columns
-  (signal_time, entry_time, expiry_time, entry_price, exit_price,
-   status, result, profit_loss, signal_score) in both pending_signals
-   and trades tables. Solves the error:
-   "column \"signal_time\" of relation \"pending_signals\" does not exist"
-- Restored legacy helper functions required by main.py and admin_bot.py
-- Normalized returned rows to dict objects for PostgreSQL and SQLite
-- Added daily stats / today trades / signals enabled helpers
+Aboud Trading Bot - Database Layer v5.5
+=======================================
+CRITICAL FIXES for legacy Render PostgreSQL schema:
+
+1. pending_signals table: if old schema has UNKNOWN NOT NULL columns
+   (e.g. detected_at) that our INSERT does not populate, safely DROP
+   and recreate the table — pending signals are transient, so no data
+   is lost. This solves:
+      "null value in column 'detected_at' of relation 'pending_signals'
+       violates not-null constraint"
+
+2. settings table: add missing updated_at column. Solves:
+      "column 'updated_at' of relation 'settings' does not exist"
+
+3. trades table: ADD-ONLY migration (adds missing columns, never drops)
+   because trades contains historical data that must be preserved.
+
+4. Fallback: if any NOT NULL column still blocks INSERT, automatically
+   drop its NOT NULL constraint on the fly (PostgreSQL only).
 """
 
 import os
@@ -63,25 +71,22 @@ def _fetchall(cur):
     return _dict_rows(cur.fetchall())
 
 
-def _table_info_sql(table_name: str):
-    if USE_POSTGRES:
-        return (
-            "SELECT column_name FROM information_schema.columns WHERE table_name = %s",
-            (table_name,),
-        )
-    return (f"PRAGMA table_info({table_name})", ())
-
+# ───────────────────────── Schema helpers ─────────────────────────
 
 def _get_existing_columns(conn, table_name: str):
     """Return a set of existing column names for the given table."""
     cur = conn.cursor()
     try:
-        sql, params = _table_info_sql(table_name)
-        cur.execute(sql, params)
-        rows = cur.fetchall()
         if USE_POSTGRES:
+            cur.execute(
+                "SELECT column_name FROM information_schema.columns WHERE table_name = %s",
+                (table_name,),
+            )
+            rows = cur.fetchall()
             return {r["column_name"] if isinstance(r, dict) else r[0] for r in rows}
-        return {r[1] for r in rows}
+        else:
+            cur.execute(f"PRAGMA table_info({table_name})")
+            return {r[1] for r in cur.fetchall()}
     except Exception as e:
         logger.warning("Could not list columns of %s: %s", table_name, e)
         try:
@@ -91,8 +96,12 @@ def _get_existing_columns(conn, table_name: str):
         return set()
 
 
+def _table_exists(conn, table_name: str) -> bool:
+    return len(_get_existing_columns(conn, table_name)) > 0
+
+
 def _ensure_column(conn, table_name: str, column_name: str, definition_sql: str):
-    """Auto-add a missing column in existing deployments."""
+    """Add a missing column if it does not already exist."""
     cur = conn.cursor()
     try:
         existing = _get_existing_columns(conn, table_name)
@@ -111,16 +120,68 @@ def _ensure_column(conn, table_name: str, column_name: str, definition_sql: str)
 
 
 def _ensure_all_columns(conn, table_name: str, columns: dict):
-    """Ensure every expected column exists. columns = {name: definition_sql}."""
     for name, definition in columns.items():
         _ensure_column(conn, table_name, name, definition)
 
 
-# ═══════════════════════════════════════════════
-# EXPECTED COLUMNS (used by auto-migration)
-# ═══════════════════════════════════════════════
+def _drop_not_null_on_unknown_columns(conn, table_name: str, known_columns: set):
+    """PostgreSQL only: drop NOT NULL constraints on any 'unknown' legacy
+    columns so that old schemas don't block our INSERTs."""
+    if not USE_POSTGRES:
+        return
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            SELECT column_name, is_nullable, column_default
+            FROM information_schema.columns
+            WHERE table_name = %s
+            """,
+            (table_name,),
+        )
+        rows = cur.fetchall()
+        for r in rows:
+            col = r["column_name"] if isinstance(r, dict) else r[0]
+            is_nullable = (r["is_nullable"] if isinstance(r, dict) else r[1]) or ""
+            col_default = (r["column_default"] if isinstance(r, dict) else r[2])
+
+            if col in known_columns:
+                continue
+            if is_nullable.upper() == "YES":
+                continue
+            if col_default is not None:
+                # Has a default, INSERT will work fine
+                continue
+            try:
+                logger.info(
+                    "🛠️  Dropping NOT NULL constraint on legacy column %s.%s",
+                    table_name, col,
+                )
+                cur.execute(
+                    f"ALTER TABLE {table_name} ALTER COLUMN {col} DROP NOT NULL"
+                )
+                conn.commit()
+            except Exception as e:
+                logger.warning(
+                    "Could not drop NOT NULL on %s.%s: %s", table_name, col, e,
+                )
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+    except Exception as e:
+        logger.warning("Could not inspect NOT NULL columns of %s: %s", table_name, e)
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+
+
+# ───────────────────────── Expected schema ─────────────────────────
+
 _PG_NUM = "DOUBLE PRECISION"
 _SL_NUM = "REAL"
+
 
 def _trades_expected_columns():
     num = _PG_NUM if USE_POSTGRES else _SL_NUM
@@ -139,19 +200,21 @@ def _trades_expected_columns():
     }
 
 
-def _pending_signals_expected_columns():
-    return {
-        "pair": "TEXT",
-        "direction": "TEXT",
-        "signal_time": "TEXT",
-        "entry_time": "TEXT",
-        "status": "TEXT DEFAULT 'PENDING'",
-        "signal_score": "INTEGER DEFAULT 0",
-        "created_at": "TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
-    }
+PENDING_SIGNALS_KNOWN = {
+    "id", "pair", "direction", "signal_time", "entry_time",
+    "status", "signal_score", "created_at",
+}
+
+TRADES_KNOWN = {
+    "id", "pair", "direction", "entry_time", "expiry_time", "entry_price",
+    "exit_price", "status", "result", "profit_loss", "signal_score",
+    "created_at",
+}
 
 
-def _create_tables(cur):
+# ───────────────────────── CREATE statements ─────────────────────────
+
+def _create_trades(cur):
     if USE_POSTGRES:
         cur.execute(
             """
@@ -168,47 +231,6 @@ def _create_tables(cur):
                 profit_loss DOUBLE PRECISION DEFAULT 0,
                 signal_score INTEGER DEFAULT 0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-            """
-        )
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS statistics (
-                id SERIAL PRIMARY KEY,
-                pair TEXT NOT NULL UNIQUE,
-                total_trades INTEGER DEFAULT 0,
-                wins INTEGER DEFAULT 0,
-                losses INTEGER DEFAULT 0,
-                draws INTEGER DEFAULT 0,
-                win_rate DOUBLE PRECISION DEFAULT 0,
-                current_streak INTEGER DEFAULT 0,
-                best_streak INTEGER DEFAULT 0,
-                worst_streak INTEGER DEFAULT 0,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-            """
-        )
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS pending_signals (
-                id SERIAL PRIMARY KEY,
-                pair TEXT NOT NULL,
-                direction TEXT NOT NULL,
-                signal_time TEXT,
-                entry_time TEXT,
-                status TEXT DEFAULT 'PENDING',
-                signal_score INTEGER DEFAULT 0,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-            """
-        )
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS settings (
-                id SERIAL PRIMARY KEY,
-                key TEXT NOT NULL UNIQUE,
-                value TEXT,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
             """
         )
@@ -231,6 +253,28 @@ def _create_tables(cur):
             )
             """
         )
+
+
+def _create_statistics(cur):
+    if USE_POSTGRES:
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS statistics (
+                id SERIAL PRIMARY KEY,
+                pair TEXT NOT NULL UNIQUE,
+                total_trades INTEGER DEFAULT 0,
+                wins INTEGER DEFAULT 0,
+                losses INTEGER DEFAULT 0,
+                draws INTEGER DEFAULT 0,
+                win_rate DOUBLE PRECISION DEFAULT 0,
+                current_streak INTEGER DEFAULT 0,
+                best_streak INTEGER DEFAULT 0,
+                worst_streak INTEGER DEFAULT 0,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+    else:
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS statistics (
@@ -248,6 +292,25 @@ def _create_tables(cur):
             )
             """
         )
+
+
+def _create_pending_signals(cur):
+    if USE_POSTGRES:
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS pending_signals (
+                id SERIAL PRIMARY KEY,
+                pair TEXT NOT NULL,
+                direction TEXT NOT NULL,
+                signal_time TEXT,
+                entry_time TEXT,
+                status TEXT DEFAULT 'PENDING',
+                signal_score INTEGER DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+    else:
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS pending_signals (
@@ -262,6 +325,21 @@ def _create_tables(cur):
             )
             """
         )
+
+
+def _create_settings(cur):
+    if USE_POSTGRES:
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS settings (
+                id SERIAL PRIMARY KEY,
+                key TEXT NOT NULL UNIQUE,
+                value TEXT,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+    else:
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS settings (
@@ -274,21 +352,125 @@ def _create_tables(cur):
         )
 
 
-def init_db():
-    """Create tables + migrate old DBs (idempotent)."""
-    conn = get_db_connection()
+# ───────────────────────── Migrations ─────────────────────────
+
+def _migrate_pending_signals(conn):
+    """pending_signals holds only *transient* in-flight signals.
+    If the legacy schema has unknown NOT NULL columns without defaults,
+    safely DROP and recreate.
+    """
     cur = conn.cursor()
-    try:
-        _create_tables(cur)
+    if not _table_exists(conn, "pending_signals"):
+        _create_pending_signals(cur)
+        conn.commit()
+        return
+
+    if not USE_POSTGRES:
+        # SQLite cannot ALTER NOT NULL easily — add missing columns and continue.
+        _ensure_all_columns(conn, "pending_signals", {
+            "signal_time": "TEXT",
+            "entry_time": "TEXT",
+            "status": "TEXT DEFAULT 'PENDING'",
+            "signal_score": "INTEGER DEFAULT 0",
+            "created_at": "TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+        })
+        return
+
+    # PostgreSQL: detect legacy columns with NOT NULL and no DEFAULT.
+    cur.execute(
+        """
+        SELECT column_name, is_nullable, column_default
+        FROM information_schema.columns
+        WHERE table_name = 'pending_signals'
+        """
+    )
+    rows = cur.fetchall()
+    unknown_blocking = []
+    for r in rows:
+        col = r["column_name"] if isinstance(r, dict) else r[0]
+        is_nullable = (r["is_nullable"] if isinstance(r, dict) else r[1]) or ""
+        col_default = (r["column_default"] if isinstance(r, dict) else r[2])
+        if col in PENDING_SIGNALS_KNOWN:
+            continue
+        if is_nullable.upper() == "YES":
+            continue
+        if col_default is not None:
+            continue
+        unknown_blocking.append(col)
+
+    if unknown_blocking:
+        logger.warning(
+            "⚠️  Legacy pending_signals schema detected (blocking NOT NULL columns: %s). "
+            "Dropping and recreating (no user data affected — only transient signals).",
+            unknown_blocking,
+        )
+        try:
+            cur.execute("DROP TABLE pending_signals CASCADE")
+            conn.commit()
+            _create_pending_signals(cur)
+            conn.commit()
+            logger.info("✅ pending_signals recreated with correct schema")
+        except Exception as e:
+            logger.error("❌ Failed to recreate pending_signals: %s", e)
+            conn.rollback()
+            raise
+        return
+
+    # No blocking columns — just add any missing ones.
+    _ensure_all_columns(conn, "pending_signals", {
+        "signal_time": "TEXT",
+        "entry_time": "TEXT",
+        "status": "TEXT DEFAULT 'PENDING'",
+        "signal_score": "INTEGER DEFAULT 0",
+        "created_at": "TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+    })
+    # Drop NOT NULL on any remaining legacy columns as an extra safety net.
+    _drop_not_null_on_unknown_columns(conn, "pending_signals", PENDING_SIGNALS_KNOWN)
+
+
+def _migrate_trades(conn):
+    """trades has historical data — only ADD missing columns, never DROP."""
+    cur = conn.cursor()
+    if not _table_exists(conn, "trades"):
+        _create_trades(cur)
+        conn.commit()
+        return
+    _ensure_all_columns(conn, "trades", _trades_expected_columns())
+    _drop_not_null_on_unknown_columns(conn, "trades", TRADES_KNOWN)
+
+
+def _migrate_settings(conn):
+    cur = conn.cursor()
+    if not _table_exists(conn, "settings"):
+        _create_settings(cur)
+        conn.commit()
+        return
+    _ensure_all_columns(conn, "settings", {
+        "value": "TEXT",
+        "updated_at": "TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+    })
+
+
+def _migrate_statistics(conn):
+    cur = conn.cursor()
+    if not _table_exists(conn, "statistics"):
+        _create_statistics(cur)
         conn.commit()
 
-        # ─── FULL AUTO-MIGRATION for old deployments ──────────
-        # Make sure every column expected by the current code exists.
-        # Handles old Render databases where new columns were never created.
-        _ensure_all_columns(conn, "trades", _trades_expected_columns())
-        _ensure_all_columns(conn, "pending_signals", _pending_signals_expected_columns())
 
-        # Backfill NULL rows
+# ───────────────────────── init_db ─────────────────────────
+
+def init_db():
+    """Create and migrate all tables (idempotent & fully automatic)."""
+    conn = get_db_connection()
+    try:
+        _migrate_trades(conn)
+        _migrate_pending_signals(conn)
+        _migrate_settings(conn)
+        _migrate_statistics(conn)
+
+        # Backfill signal_score NULLs
+        cur = conn.cursor()
         try:
             cur.execute("UPDATE trades SET signal_score = 0 WHERE signal_score IS NULL")
             cur.execute("UPDATE pending_signals SET signal_score = 0 WHERE signal_score IS NULL")
@@ -299,24 +481,37 @@ def init_db():
 
         # Initial statistics rows
         from config import TRADING_PAIRS
+        cur = conn.cursor()
         for pair in TRADING_PAIRS:
-            if USE_POSTGRES:
-                cur.execute(
-                    "INSERT INTO statistics (pair) VALUES (%s) ON CONFLICT (pair) DO NOTHING",
-                    (pair,),
-                )
-            else:
-                cur.execute("INSERT OR IGNORE INTO statistics (pair) VALUES (?)", (pair,))
+            try:
+                if USE_POSTGRES:
+                    cur.execute(
+                        "INSERT INTO statistics (pair) VALUES (%s) ON CONFLICT (pair) DO NOTHING",
+                        (pair,),
+                    )
+                else:
+                    cur.execute(
+                        "INSERT OR IGNORE INTO statistics (pair) VALUES (?)", (pair,)
+                    )
+            except Exception as e:
+                logger.warning("Could not seed statistics for %s: %s", pair, e)
+                conn.rollback()
         conn.commit()
 
-        # Default settings
-        if get_setting("signals_enabled", None) is None:
-            set_setting("signals_enabled", "true")
+        # Default setting
+        try:
+            if get_setting("signals_enabled", None) is None:
+                set_setting("signals_enabled", "true")
+        except Exception as e:
+            logger.warning("Could not set default signals_enabled: %s", e)
 
         logger.info("✅ Database initialized & migrated successfully")
     except Exception as e:
         logger.error("❌ Database initialization failed: %s", e, exc_info=True)
-        conn.rollback()
+        try:
+            conn.rollback()
+        except Exception:
+            pass
         raise
     finally:
         conn.close()
@@ -333,6 +528,9 @@ def get_setting(key, default=None):
         cur.execute(f"SELECT value FROM settings WHERE key = {_ph()}", (key,))
         row = _fetchone(cur)
         return row["value"] if row else default
+    except Exception as e:
+        logger.warning("get_setting failed (%s): %s", key, e)
+        return default
     finally:
         conn.close()
 
@@ -341,22 +539,53 @@ def set_setting(key, value):
     conn = get_db_connection()
     cur = conn.cursor()
     try:
+        # First try full INSERT with updated_at
+        try:
+            if USE_POSTGRES:
+                cur.execute(
+                    """
+                    INSERT INTO settings (key, value, updated_at)
+                    VALUES (%s, %s, CURRENT_TIMESTAMP)
+                    ON CONFLICT (key)
+                    DO UPDATE SET value = EXCLUDED.value, updated_at = CURRENT_TIMESTAMP
+                    """,
+                    (key, str(value)),
+                )
+            else:
+                cur.execute(
+                    "INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)",
+                    (key, str(value)),
+                )
+            conn.commit()
+            return
+        except Exception as e:
+            conn.rollback()
+            logger.warning(
+                "set_setting with updated_at failed: %s (falling back without updated_at)", e,
+            )
+
+        # Fallback: write without updated_at (old schema)
         if USE_POSTGRES:
             cur.execute(
                 """
-                INSERT INTO settings (key, value, updated_at)
-                VALUES (%s, %s, CURRENT_TIMESTAMP)
-                ON CONFLICT (key)
-                DO UPDATE SET value = EXCLUDED.value, updated_at = CURRENT_TIMESTAMP
+                INSERT INTO settings (key, value)
+                VALUES (%s, %s)
+                ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
                 """,
                 (key, str(value)),
             )
         else:
             cur.execute(
-                "INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)",
+                "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
                 (key, str(value)),
             )
         conn.commit()
+    except Exception as e:
+        logger.warning("set_setting final failure (%s): %s", key, e)
+        try:
+            conn.rollback()
+        except Exception:
+            pass
     finally:
         conn.close()
 
