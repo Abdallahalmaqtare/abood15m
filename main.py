@@ -1,12 +1,16 @@
 """
-Aboud Trading Bot - Main v5.1 (FIXED)
-========================================
+Aboud Trading Bot - Main v6.1 (RESULT DELIVERY FIX)
+=====================================================
 FIXES:
 - Keep-alive ping every 13 minutes (prevents Render sleep)
 - Better webhook error handling (fixes 500 errors)
 - Startup message spam fixed (6 hour cooldown)
-- Webhook timeout increased to 30s
+- Webhook timeout increased to 25s
 - Flask starts AFTER bot initialization
+- NEW in v6.1: SignalManager.recover_pending_trades() is invoked right
+  after init_db(). This rehydrates trades that were mid-flight when the
+  process restarted (very common on Render free tier), so the 15-minute
+  result message is still delivered instead of being lost forever.
 """
 import asyncio, logging, threading, json, time, os
 from datetime import datetime, timezone
@@ -169,6 +173,14 @@ async def run_bot():
     telegram_sender = TelegramSender()
     signal_manager = SignalManager(telegram_sender)
 
+    # --- v6.1 recovery: resume any trades that were in flight before restart
+    try:
+        recovered = await signal_manager.recover_pending_trades()
+        if recovered:
+            logger.info("♻️  Recovered %d in-flight trade(s) after restart", recovered)
+    except Exception as e:
+        logger.warning("Recovery step failed (non-critical): %s", e)
+
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     application.bot_data["signal_manager"] = signal_manager
     setup_admin_handlers(application)
@@ -191,7 +203,7 @@ async def run_bot():
     bot_ready = True
 
     logger.info("=" * 50)
-    logger.info("  Aboud Trading Bot v5.1 PRO (FIXED)")
+    logger.info("  Aboud Trading Bot v6.1 PRO (RESULT FIX)")
     logger.info(f"  DB: {'PostgreSQL' if DATABASE_URL else 'SQLite'}")
     logger.info(f"  Pairs: EURUSD, GBPUSD")
     logger.info(f"  Min Score: {MIN_SIGNAL_SCORE}/10")
@@ -200,7 +212,7 @@ async def run_bot():
 
     if _should_send_startup():
         await telegram_sender.send_text(
-            f"🟢 <b>Aboud Trading Bot v5.1 PRO</b>\n\n"
+            f"🟢 <b>Aboud Trading Bot v6.1 PRO</b>\n\n"
             f"📊 EURUSD, GBPUSD\n"
             f"⏱ 15 min | 🕐 UTC+{BOT_UTC_OFFSET}\n"
             f"🎯 Min Signal Score: {MIN_SIGNAL_SCORE}/10\n"
