@@ -1,11 +1,13 @@
 """
-Aboud Trading Bot - Messages v4.0 (UPGRADED)
-==============================================
-Updated for EURUSD + GBPUSD
-Added signal score display
-All display times in UTC+3
+Aboud Trading Bot - Messages v5.0 (RESTORED CLASSIC FORMAT)
+==========================================================
+Changes vs v4.0:
+- RESTORED classic POCKETOPTION BOT message layout (matching old screenshots)
+- Entry time shows HH:MM only in UTC+3 (no date, no signal score)
+- Result messages sent immediately after trade ends
+- Format exactly matches: "Aboud Trading 15M POCKETOPTION BOT 🔵"
 """
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from config import BOT_TIMEZONE, BOT_UTC_OFFSET
 
 
@@ -13,63 +15,92 @@ def _now():
     return datetime.now(BOT_TIMEZONE)
 
 
-def _score_label(score):
-    """Return Arabic label for signal score."""
-    try:
-        s = float(score)
-    except (TypeError, ValueError):
-        return "—"
-    if s >= 9:
-        return "🔥 قوية جداً"
-    elif s >= 8:
-        return "💪 قوية"
-    elif s >= 7:
-        return "✅ جيدة"
+def _to_local_hhmm(entry_time):
+    """Convert entry_time (could be string 'YYYY-MM-DD HH:MM:SS' in UTC, or
+    datetime, or epoch ms int) to HH:MM string in the bot's local timezone (UTC+3)."""
+    dt = None
+    if entry_time is None:
+        return ""
+    if isinstance(entry_time, datetime):
+        dt = entry_time if entry_time.tzinfo else entry_time.replace(tzinfo=timezone.utc)
     else:
-        return "⚠️ ضعيفة"
+        txt = str(entry_time).strip()
+        # Try epoch (millis or seconds)
+        try:
+            ts = int(txt)
+            if ts > 1_000_000_000_000:
+                ts = ts / 1000
+            dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+        except (ValueError, OSError):
+            pass
+        if dt is None:
+            for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M"):
+                try:
+                    dt = datetime.strptime(txt, fmt).replace(tzinfo=timezone.utc)
+                    break
+                except ValueError:
+                    continue
+        if dt is None:
+            # Fallback: return the string as-is if it already looks like HH:MM
+            return txt[-8:-3] if len(txt) >= 16 else txt
 
+    local = dt.astimezone(BOT_TIMEZONE)
+    return local.strftime("%H:%M")
+
+
+# ════════════════════════════════════════════════════════════
+# CLASSIC SIGNAL MESSAGE (matches old POCKETOPTION BOT format)
+# ════════════════════════════════════════════════════════════
 
 def format_signal_message(pair, direction, entry_time, stats, score=None):
+    """Classic POCKETOPTION BOT message (no score, no date, UTC+3 time)."""
     de = "🟢" if direction == "CALL" else "🔴"
     w = stats.get("total_wins", 0)
     l = stats.get("total_losses", 0)
     t = w + l
     r = round((w / t) * 100) if t > 0 else 0
 
-    score_display = ""
-    if score is not None:
-        score_display = (
-            f"📊 <b>قوة الإشارة: {score}/10</b> ({_score_label(score)})\n"
-        )
+    hhmm = _to_local_hhmm(entry_time)
 
     msg = (
-        f"》 ABOOD TRADING 15M 《\n\n"
+        f"》 ABOUD 15 M 《\n\n"
         f"📊 <b>{pair}</b>\n"
         f"{de} <b>{direction}</b>\n"
-        f"🕐 <b>{entry_time}</b>\n"
-        f"⏳ <b>15 minutes</b>\n\n"
-        f"{score_display}"
+        f"🕐 <b>{hhmm}</b>\n"
+        f"⏳ <b>15 minutes</b>\n"
     )
     if t > 0:
-        msg += f"Win: {w} | Loss: {l} ({r}%)\nPair {pair}: {w}x{l} ({r}%)\n"
+        msg += f"\nWin: {w} | Loss: {l} ({r}%)\nPair {pair}: {w}x{l} ({r}%)\n"
     return msg
 
 
 def format_result_message(pair, direction, entry_time, result):
+    """Classic immediate result message."""
     arrow = "⬆️" if direction == "CALL" else "⬇️"
+    hhmm = _to_local_hhmm(entry_time)
     if result == "WIN":
         return (
             f"<b>Aboud Trading 15M POCKETOPTION BOT</b> 🔵\n\n"
-            f"✅ → {pair} {entry_time} {arrow}\n\n"
+            f"✅ → {pair} {hhmm} {arrow}\n\n"
             f"<b>🏆 WIN!</b>\n"
+        )
+    elif result == "LOSS":
+        return (
+            f"<b>Aboud Trading 15M POCKETOPTION BOT</b> 🔵\n\n"
+            f"❌ → {pair} {hhmm} {arrow}\n\n"
+            f"<b>💔 LOSS</b>\n"
         )
     else:
         return (
             f"<b>Aboud Trading 15M POCKETOPTION BOT</b> 🔵\n\n"
-            f"❌ → {pair} {entry_time} {arrow}\n\n"
-            f"<b>💔 LOSS</b>\n"
+            f"➖ → {pair} {hhmm} {arrow}\n\n"
+            f"<b>🤝 DRAW</b>\n"
         )
 
+
+# ════════════════════════════════════════════════════════════
+# Statistics / Admin messages (unchanged from v4.0)
+# ════════════════════════════════════════════════════════════
 
 def format_stats_message(stats_list):
     tw = sum(s.get("total_wins", 0) for s in stats_list)
@@ -94,7 +125,6 @@ def format_stats_message(stats_list):
 
 
 def format_overall_stats(stats_list):
-    """All-time cumulative statistics."""
     tw = sum(s.get("total_wins", 0) for s in stats_list)
     tl = sum(s.get("total_losses", 0) for s in stats_list)
     t = tw + tl
@@ -118,7 +148,7 @@ def format_overall_stats(stats_list):
         sr = round((w / st) * 100) if st > 0 else 0
         msg += f"  📊 <b>{p}</b>: ✅ {w} | ❌ {l} | 🎯 {sr}%\n"
 
-    msg += f"\n<i>🤖 Aboud Trading Bot v4.0 PRO</i>\n"
+    msg += f"\n<i>🤖 Aboud Trading Bot v6.0 PRO</i>\n"
     return msg
 
 
@@ -153,12 +183,11 @@ def format_daily_report(daily_stats, today_trades=None):
         sr = round((w / st) * 100) if st > 0 else 0
         msg += f"  📊 <b>{p}</b>: ✅ {w} | ❌ {l} | 🎯 {sr}%\n"
 
-    msg += f"\n<i>🤖 Aboud Trading Bot v4.0 PRO</i>\n"
+    msg += f"\n<i>🤖 Aboud Trading Bot v6.0 PRO</i>\n"
     return msg
 
 
 def format_recent_trades(trades):
-    """Format last N trades."""
     if not trades:
         return "<b>📋 آخر الصفقات</b>\n\nلا توجد صفقات سابقة."
 
@@ -170,20 +199,17 @@ def format_recent_trades(trades):
         arrow = "⬆️" if dire == "CALL" else "⬇️"
         ep = t.get("entry_price")
         xp = t.get("exit_price")
-        sc = t.get("signal_score")
         ep_str = f"{ep:.5f}" if ep else "N/A"
         xp_str = f"{xp:.5f}" if xp else "N/A"
-        sc_str = f" | Score: {sc}" if sc else ""
 
         msg += (
-            f"{re} <b>{pair}</b> {arrow} {dire}{sc_str}\n"
+            f"{re} <b>{pair}</b> {arrow} {dire}\n"
             f"   Entry: {ep_str} → Exit: {xp_str}\n\n"
         )
     return msg
 
 
 def format_active_trade(trade):
-    """Format current active trade info."""
     if not trade:
         return "<b>📊 الصفقة النشطة</b>\n\n⚪ لا توجد صفقة نشطة حالياً."
 
@@ -215,7 +241,7 @@ def format_signal_cancelled_message(pair, direction, reason="Signal reversed"):
 
 def format_admin_help():
     return (
-        f"<b>🛠 Aboud Trading v4.0 PRO - لوحة التحكم</b>\n"
+        f"<b>🛠 Aboud Trading v6.0 PRO - لوحة التحكم</b>\n"
         f"{'━' * 32}\n\n"
         f"/start - تشغيل البوت\n"
         f"/stats - إحصائيات اليوم\n"
@@ -229,7 +255,7 @@ def format_admin_help():
         f"/reset - تصفير النتائج\n"
         f"/status - حالة البوت\n\n"
         f"<b>الأزواج:</b> EURUSD, GBPUSD\n"
-        f"<b>الحد الأدنى للإشارة:</b> 7/10\n\n"
+        f"<b>الحد الأدنى للإشارة:</b> 6/8\n\n"
         f"<i>🔒 أوامر الأدمن فقط</i>\n"
     )
 
@@ -246,8 +272,7 @@ def format_status_message(signals_enabled, pending_count, today_count):
         f"صفقات اليوم: <b>{today_count}</b>\n"
         f"الأزواج: EURUSD, GBPUSD\n"
         f"الفريم: 15 دقيقة\n"
-        f"ساعات التداول: 10:00 - 23:00 (UTC+3)\n"
         f"التوقيت: UTC+{BOT_UTC_OFFSET}\n"
         f"الوقت: {now.strftime('%H:%M:%S')}\n\n"
-        f"<i>🤖 Aboud Trading Bot v4.0 PRO</i>\n"
+        f"<i>🤖 Aboud Trading Bot v6.0 PRO</i>\n"
     )
