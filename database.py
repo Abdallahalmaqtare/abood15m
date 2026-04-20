@@ -933,9 +933,11 @@ def get_daily_stats():
 # ═══════════════════════════════════════════════
 
 def reset_all_statistics():
+    """Reset all statistics, trades, and pending signals."""
     conn = get_db_connection()
     cur = conn.cursor()
     try:
+        # 1. Reset cumulative statistics for all pairs
         cur.execute(
             """
             UPDATE statistics
@@ -944,8 +946,21 @@ def reset_all_statistics():
                 worst_streak = 0, updated_at = CURRENT_TIMESTAMP
             """
         )
+        
+        # 2. Delete all trade history (this also resets daily stats since they are derived from trades)
         cur.execute("DELETE FROM trades")
+        
+        # 3. Delete all pending signals
         cur.execute("DELETE FROM pending_signals")
+        
+        # 4. Reset any other settings if necessary (optional)
+        # cur.execute("DELETE FROM settings WHERE key = 'last_startup'")
+        
         conn.commit()
+        logger.info("✅ All statistics and trade history have been reset.")
+    except Exception as e:
+        conn.rollback()
+        logger.error("❌ Failed to reset statistics: %s", e)
+        raise
     finally:
         conn.close()
