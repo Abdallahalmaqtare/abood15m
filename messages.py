@@ -1,11 +1,11 @@
 """
-Aboud Trading Bot - Messages v6.0 (RESTORED CLASSIC FORMAT)
+Aboud Trading Bot - Messages v5.0 (RESTORED CLASSIC FORMAT)
 ==========================================================
-Changes:
+Changes vs v4.0:
 - RESTORED classic POCKETOPTION BOT message layout (matching old screenshots)
-- Entry time shows HH:MM only in UTC+3
-- Added Signal Score back in a clean way matching the user's request
+- Entry time shows HH:MM only in UTC+3 (no date, no signal score)
 - Result messages sent immediately after trade ends
+- Format exactly matches: "Aboud Trading 15M POCKETOPTION BOT 🔵"
 """
 from datetime import datetime, timezone, timedelta
 from config import BOT_TIMEZONE, BOT_UTC_OFFSET
@@ -16,7 +16,8 @@ def _now():
 
 
 def _to_local_hhmm(entry_time):
-    """Convert entry_time to HH:MM string in the bot's local timezone (UTC+3)."""
+    """Convert entry_time (could be string 'YYYY-MM-DD HH:MM:SS' in UTC, or
+    datetime, or epoch ms int) to HH:MM string in the bot's local timezone (UTC+3)."""
     dt = None
     if entry_time is None:
         return ""
@@ -52,7 +53,7 @@ def _to_local_hhmm(entry_time):
 # ════════════════════════════════════════════════════════════
 
 def format_signal_message(pair, direction, entry_time, stats, score=None):
-    """Classic POCKETOPTION BOT message with score."""
+    """Classic POCKETOPTION BOT message (no score, no date, UTC+3 time)."""
     de = "🟢" if direction == "CALL" else "🔴"
     w = stats.get("total_wins", 0)
     l = stats.get("total_losses", 0)
@@ -62,19 +63,12 @@ def format_signal_message(pair, direction, entry_time, stats, score=None):
     hhmm = _to_local_hhmm(entry_time)
 
     msg = (
-        f"⚡ Abood Trading ⚡\n"
-        f"<b>Aboud Trading 15M POCKETOPTION BOT</b> 🔵\n"
         f"》 ABOUD 15 M 《\n\n"
         f"📊 <b>{pair}</b>\n"
         f"{de} <b>{direction}</b>\n"
         f"🕐 <b>{hhmm}</b>\n"
         f"⏳ <b>15 minutes</b>\n"
     )
-    
-    if score:
-        quality = "جيدة" if score >= 7 else "متوسطة"
-        msg += f"\n📊 قوة الإشارة: {score}/10 ( ✅ {quality})\n"
-
     if t > 0:
         msg += f"\nWin: {w} | Loss: {l} ({r}%)\nPair {pair}: {w}x{l} ({r}%)\n"
     return msg
@@ -84,31 +78,28 @@ def format_result_message(pair, direction, entry_time, result):
     """Classic immediate result message."""
     arrow = "⬆️" if direction == "CALL" else "⬇️"
     hhmm = _to_local_hhmm(entry_time)
-    
-    header = "⚡ Abood Trading ⚡\n<b>Aboud Trading 15M POCKETOPTION BOT</b> 🔵\n\n"
-    
     if result == "WIN":
         return (
-            f"{header}"
+            f"<b>Aboud Trading 15M POCKETOPTION BOT</b> 🔵\n\n"
             f"✅ → {pair} {hhmm} {arrow}\n\n"
             f"<b>🏆 WIN!</b>\n"
         )
     elif result == "LOSS":
         return (
-            f"{header}"
+            f"<b>Aboud Trading 15M POCKETOPTION BOT</b> 🔵\n\n"
             f"❌ → {pair} {hhmm} {arrow}\n\n"
             f"<b>💔 LOSS</b>\n"
         )
     else:
         return (
-            f"{header}"
+            f"<b>Aboud Trading 15M POCKETOPTION BOT</b> 🔵\n\n"
             f"➖ → {pair} {hhmm} {arrow}\n\n"
             f"<b>🤝 DRAW</b>\n"
         )
 
 
 # ════════════════════════════════════════════════════════════
-# Statistics / Admin messages
+# Statistics / Admin messages (unchanged from v4.0)
 # ════════════════════════════════════════════════════════════
 
 def format_stats_message(stats_list):
@@ -157,7 +148,7 @@ def format_overall_stats(stats_list):
         sr = round((w / st) * 100) if st > 0 else 0
         msg += f"  📊 <b>{p}</b>: ✅ {w} | ❌ {l} | 🎯 {sr}%\n"
 
-    msg += f"\n<i>🤖 Aboud Trading Bot v6.1 PRO</i>\n"
+    msg += f"\n<i>🤖 Aboud Trading Bot v6.0 PRO</i>\n"
     return msg
 
 
@@ -192,7 +183,7 @@ def format_daily_report(daily_stats, today_trades=None):
         sr = round((w / st) * 100) if st > 0 else 0
         msg += f"  📊 <b>{p}</b>: ✅ {w} | ❌ {l} | 🎯 {sr}%\n"
 
-    msg += f"\n<i>🤖 Aboud Trading Bot v6.1 PRO</i>\n"
+    msg += f"\n<i>🤖 Aboud Trading Bot v6.0 PRO</i>\n"
     return msg
 
 
@@ -250,7 +241,7 @@ def format_signal_cancelled_message(pair, direction, reason="Signal reversed"):
 
 def format_admin_help():
     return (
-        f"<b>🛠 Aboud Trading v6.1 PRO - لوحة التحكم</b>\n"
+        f"<b>🛠 Aboud Trading v6.0 PRO - لوحة التحكم</b>\n"
         f"{'━' * 32}\n\n"
         f"/start - تشغيل البوت\n"
         f"/stats - إحصائيات اليوم\n"
@@ -283,5 +274,5 @@ def format_status_message(signals_enabled, pending_count, today_count):
         f"الفريم: 15 دقيقة\n"
         f"التوقيت: UTC+{BOT_UTC_OFFSET}\n"
         f"الوقت: {now.strftime('%H:%M:%S')}\n\n"
-        f"<i>🤖 Aboud Trading Bot v6.1 PRO</i>\n"
+        f"<i>🤖 Aboud Trading Bot v6.0 PRO</i>\n"
     )
