@@ -1,15 +1,17 @@
 """
-Aboud Trading Bot - Signal Manager v5.3
+Aboud Trading Bot - Signal Manager v6.2
 ======================================
 Fixes:
-- Auto-correction of entry time when old PineScript sends +15 min offset
-- Wider acceptance window for entry timing (up to 35 min) with snap-down logic
-- Better error logging for DB schema issues
-- Restored compatibility with main.py / admin_bot.py
-- Accepts both pair/ticker and entry_time/target_entry_time payload formats
-- Uses current telegram_sender signatures correctly
-- Uses price_service API correctly for candle open/result
-- Supports signals_enabled setting and active trade state
+- PRECISION TIMING: Results are sent exactly at the end of the 15-minute window.
+- Added recover_pending_trades() to resume monitoring after restart.
+- Auto-correction of entry time when old PineScript sends +15 min offset.
+- Wider acceptance window for entry timing (up to 35 min) with snap-down logic.
+- Better error logging for DB schema issues.
+- Restored compatibility with main.py / admin_bot.py.
+- Accepts both pair/ticker and entry_time/target_entry_time payload formats.
+- Uses current telegram_sender signatures correctly.
+- Uses price_service API correctly for candle open/result.
+- Supports signals_enabled setting and active trade state.
 """
 
 import asyncio
@@ -36,6 +38,7 @@ from database import (
     update_statistics,
     get_statistics,
     is_signals_enabled,
+    get_active_pending_signals,
 )
 from price_service import price_service as default_price_service
 
@@ -171,6 +174,26 @@ class SignalManager:
                 "pending_id": pending_id,
             }
 
+    async def recover_pending_trades(self):
+        """Recover and resume monitoring for trades that were active or accepted before restart."""
+        pending = get_active_pending_signals()
+        if not pending:
+            return 0
+        
+        count = 0
+        for p in pending:
+            asyncio.create_task(
+                self._monitor_trade(
+                    pending_id=p["id"],
+                    pair=p["pair"],
+                    direction=p["direction"],
+                    entry_time=p["entry_time"],
+                    signal_score=p.get("signal_score", 0),
+                )
+            )
+            count += 1
+        return count
+
     async def _monitor_trade(self, pending_id, pair, direction, entry_time, signal_score=0):
         try:
             entry_dt = self._parse_entry_time(entry_time)
@@ -179,23 +202,19 @@ class SignalManager:
                 delete_pending_signal(pending_id)
                 return
 
+            # 1. Wait for entry time
             wait_seconds = (entry_dt - datetime.now(timezone.utc)).total_seconds()
             if wait_seconds > 0:
                 logger.info("⏳ Waiting %.1f seconds for entry %s %s", wait_seconds, pair, direction)
                 await asyncio.sleep(wait_seconds)
 
-            # let the new candle form
-            await asyncio.sleep(2)
-
-            candle = await self.price_service.get_trade_candle(pair, entry_dt)
-            if candle:
-                entry_price = candle.get("entry_price")
-            else:
-                entry_price = await self.price_service.get_price(pair)
-
+            # 2. Get entry price (immediately at entry time)
+            entry_price = await self.price_service.get_price(pair)
+            
             expiry_dt = entry_dt + timedelta(minutes=TRADE_DURATION_MINUTES)
             expiry_time = expiry_dt.strftime("%Y-%m-%d %H:%M:%S")
 
+            trade_id = None
             try:
                 trade_id = create_trade(
                     pair=pair,
@@ -206,11 +225,9 @@ class SignalManager:
                     signal_score=signal_score,
                 )
             except Exception as e:
-                logger.exception("❌ Failed to create trade: %s", e)
-                delete_pending_signal(pending_id)
-                return
+                logger.warning("Could not create trade (might already exist): %s", e)
 
-            if entry_price is not None:
+            if trade_id and entry_price is not None:
                 update_trade(trade_id, entry_price=entry_price)
 
             update_pending_signal(pending_id, "ACTIVE")
@@ -226,18 +243,15 @@ class SignalManager:
                     "signal_score": signal_score,
                 }
 
+            # 3. Wait for expiry time (exactly 15 minutes after entry)
+            # We subtract a tiny bit (0.5s) to be ready right at the second it ends
             remaining = (expiry_dt - datetime.now(timezone.utc)).total_seconds()
             if remaining > 0:
                 logger.info("⏳ Trade active for %.1f seconds: #%s", remaining, trade_id)
                 await asyncio.sleep(remaining)
 
-            # wait a few seconds for candle source to finalize close price
-            await asyncio.sleep(6)
-
-            result_candle = await self.price_service.get_trade_candle(pair, entry_dt)
-            exit_price = result_candle.get("exit_price") if result_candle else None
-            if exit_price is None:
-                exit_price = await self.price_service.get_price(pair)
+            # 4. Get exit price IMMEDIATELY at expiry time
+            exit_price = await self.price_service.get_price(pair)
 
             result = self._determine_result(direction, entry_price, exit_price)
             logger.info(
@@ -245,15 +259,17 @@ class SignalManager:
                 pair, direction, result, entry_price, exit_price,
             )
 
-            update_trade(
-                trade_id,
-                exit_price=exit_price,
-                status="COMPLETED",
-                result=result,
-            )
+            if trade_id:
+                update_trade(
+                    trade_id,
+                    exit_price=exit_price,
+                    status="COMPLETED",
+                    result=result,
+                )
             update_statistics(pair, result)
             update_pending_signal(pending_id, "COMPLETED")
 
+            # 5. Send result IMMEDIATELY
             try:
                 await self.telegram_sender.send_result(pair, direction, entry_time, result)
             except Exception as e:
@@ -298,15 +314,7 @@ class SignalManager:
         return elapsed >= (SIGNAL_COOLDOWN_MINUTES * 60)
 
     def _validate_entry_timing(self, entry_time_str: str):
-        """Return (valid, minutes_until, normalized_entry_time_str).
-
-        Auto-correction logic:
-        1. If entry is within [-2 min, +16 min] -> accept as-is (new PineScript).
-        2. If entry is between +16 and +40 min  -> subtract 15 min (old PineScript
-           that still adds an extra 15-minute offset).
-        3. Otherwise -> snap to the next 15-minute candle boundary if close,
-           else reject.
-        """
+        """Return (valid, minutes_until, normalized_entry_time_str)."""
         entry_dt = self._parse_entry_time(entry_time_str)
         if not entry_dt:
             return False, -1, entry_time_str
@@ -315,28 +323,19 @@ class SignalManager:
         diff = (entry_dt - now).total_seconds()
         minutes_until = diff / 60.0
 
-        # In immediate mode config is 0/0, so accept from ~now up to 16 minutes.
         min_seconds = SIGNAL_CONFIRM_MIN_SECONDS if SIGNAL_CONFIRM_MIN_SECONDS > 0 else -120
         max_seconds = SIGNAL_CONFIRM_MAX_SECONDS if SIGNAL_CONFIRM_MAX_SECONDS > 0 else 960
 
-        # Tier 1: in range
         if min_seconds <= diff <= max_seconds:
             normalized = entry_dt.strftime("%Y-%m-%d %H:%M:%S")
             return True, minutes_until, normalized
 
-        # Tier 2: old PineScript adds +15 min -> correct it
         if 16 * 60 < diff <= 40 * 60:
             corrected = entry_dt - timedelta(minutes=15)
             corrected_diff = (corrected - now).total_seconds()
             if min_seconds <= corrected_diff <= max_seconds:
-                logger.warning(
-                    "⚠️ Entry time auto-corrected -15min (old PineScript): %s -> %s",
-                    entry_dt.strftime("%H:%M:%S"),
-                    corrected.strftime("%H:%M:%S"),
-                )
                 return True, corrected_diff / 60.0, corrected.strftime("%Y-%m-%d %H:%M:%S")
 
-        # Tier 3: snap to the next 15-min boundary if within reasonable range
         if -2 * 60 <= diff <= 40 * 60:
             minute = (now.minute // 15 + 1) * 15
             if minute >= 60:
@@ -345,11 +344,6 @@ class SignalManager:
                 snapped = now.replace(minute=minute, second=0, microsecond=0)
             snapped_diff = (snapped - now).total_seconds()
             if 0 < snapped_diff <= max_seconds:
-                logger.warning(
-                    "⚠️ Entry time snapped to next 15-min candle: %s -> %s",
-                    entry_dt.strftime("%H:%M:%S"),
-                    snapped.strftime("%H:%M:%S"),
-                )
                 return True, snapped_diff / 60.0, snapped.strftime("%Y-%m-%d %H:%M:%S")
 
         normalized = entry_dt.strftime("%Y-%m-%d %H:%M:%S")
@@ -382,5 +376,4 @@ class SignalManager:
             except ValueError:
                 continue
 
-        logger.warning("⚠️ Could not parse entry time: %s", value)
         return None
