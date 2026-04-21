@@ -1,16 +1,17 @@
 """
-Aboud Trading Bot - Main v6.1 (RESULT DELIVERY FIX)
-=====================================================
-FIXES:
-- Keep-alive ping every 13 minutes (prevents Render sleep)
-- Better webhook error handling (fixes 500 errors)
-- Startup message spam fixed (6 hour cooldown)
-- Webhook timeout increased to 25s
-- Flask starts AFTER bot initialization
-- NEW in v6.1: SignalManager.recover_pending_trades() is invoked right
-  after init_db(). This rehydrates trades that were mid-flight when the
-  process restarted (very common on Render free tier), so the 15-minute
-  result message is still delivered instead of being lost forever.
+Aboud Trading Bot - Main v6.2 (TV-RESULT DELIVERY)
+====================================================
+FIXES vs v6.1:
+- Accepts the new `action=RESULT` webhook from Pine Script v6.1 — carries
+  the real TradingView entry_price (candle open) and exit_price
+  (candle close). This replaces the unreliable TwelveData / Yahoo
+  candle fetch as the primary result source, so the WIN / LOSS
+  message is ALWAYS delivered immediately when the entry candle closes.
+- External price APIs are kept only as a last-resort fallback.
+- Exactly 2 TradingView webhook calls per trade (SIGNAL + RESULT),
+  so TradingView is never overloaded.
+- recover_pending_trades() still runs after init_db() so trades that
+  were mid-flight during a restart are resumed correctly.
 """
 import asyncio, logging, threading, json, time, os
 from datetime import datetime, timezone
@@ -47,7 +48,7 @@ bot_ready = False  # Flag to track if bot is fully initialized
 def health():
     return jsonify({
         "status": "ok",
-        "bot": "v5.1-pro",
+        "bot": "v6.2-pro",
         "ready": bot_ready,
         "pg": bool(DATABASE_URL),
         "time": datetime.now(timezone.utc).isoformat(),
@@ -98,9 +99,13 @@ def webhook():
             return jsonify({"error": "Unauthorized"}), 401
 
         logger.info(
-            "Webhook received: pair=%s dir=%s action=%s score=%s",
-            data.get("pair"), data.get("direction"),
-            data.get("action"), data.get("signal_score")
+            "Webhook received: pair=%s dir=%s action=%s score=%s entry=%s exit=%s",
+            data.get("pair") or data.get("ticker"),
+            data.get("direction"),
+            data.get("action"),
+            data.get("signal_score"),
+            data.get("entry_price"),
+            data.get("exit_price"),
         )
 
         # Process signal with increased timeout
@@ -203,21 +208,23 @@ async def run_bot():
     bot_ready = True
 
     logger.info("=" * 50)
-    logger.info("  Aboud Trading Bot v6.1 PRO (RESULT FIX)")
+    logger.info("  Aboud Trading Bot v6.2 PRO (TV-RESULT)")
     logger.info(f"  DB: {'PostgreSQL' if DATABASE_URL else 'SQLite'}")
-    logger.info(f"  Pairs: EURUSD, GBPUSD")
+    logger.info(f"  Pairs: {', '.join(__import__('config').TRADING_PAIRS)}")
     logger.info(f"  Min Score: {MIN_SIGNAL_SCORE}/10")
     logger.info(f"  Keep-alive: every 13 min")
+    logger.info(f"  Result source: TradingView RESULT webhook (API fallback only)")
     logger.info("=" * 50)
 
     if _should_send_startup():
+        from config import TRADING_PAIRS
         await telegram_sender.send_text(
-            f"🟢 <b>Aboud Trading Bot v6.1 PRO</b>\n\n"
-            f"📊 EURUSD, GBPUSD\n"
+            f"🟢 <b>Aboud Trading Bot v6.2 PRO</b>\n\n"
+            f"📊 {', '.join(TRADING_PAIRS)}\n"
             f"⏱ 15 min | 🕐 UTC+{BOT_UTC_OFFSET}\n"
             f"🎯 Min Signal Score: {MIN_SIGNAL_SCORE}/10\n"
-            f"⏰ Trading: 10:00-23:00 (UTC+3)\n"
             f"💾 DB: {'☁️ PostgreSQL' if DATABASE_URL else '📁 SQLite'}\n"
+            f"🔄 Result delivery: TV webhook ✅\n"
             f"🔄 Active | Keep-alive ✅",
         )
 
