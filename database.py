@@ -451,11 +451,40 @@ def _migrate_settings(conn):
     })
 
 
+def _statistics_expected_columns():
+    num = _PG_NUM if USE_POSTGRES else _SL_NUM
+    return {
+        "pair": "TEXT",
+        "total_trades": "INTEGER DEFAULT 0",
+        "wins": "INTEGER DEFAULT 0",
+        "losses": "INTEGER DEFAULT 0",
+        "draws": "INTEGER DEFAULT 0",
+        "win_rate": f"{num} DEFAULT 0",
+        "current_streak": "INTEGER DEFAULT 0",
+        "best_streak": "INTEGER DEFAULT 0",
+        "worst_streak": "INTEGER DEFAULT 0",
+        "updated_at": "TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+    }
+
+
+STATISTICS_KNOWN = {
+    "id", "pair", "total_trades", "wins", "losses", "draws",
+    "win_rate", "current_streak", "best_streak", "worst_streak",
+    "updated_at",
+}
+
+
 def _migrate_statistics(conn):
+    """statistics has cumulative counters - only ADD missing columns.
+    This is important for databases that were created with an older
+    schema (e.g. without the `total_trades` column)."""
     cur = conn.cursor()
     if not _table_exists(conn, "statistics"):
         _create_statistics(cur)
         conn.commit()
+        return
+    _ensure_all_columns(conn, "statistics", _statistics_expected_columns())
+    _drop_not_null_on_unknown_columns(conn, "statistics", STATISTICS_KNOWN)
 
 
 # ───────────────────────── init_db ─────────────────────────
@@ -828,27 +857,45 @@ def _normalize_stats_row(row):
 
 
 def update_statistics(pair, result):
+    """Update the cumulative counters for a pair after a trade closes.
+
+    This is written defensively so that even if the `statistics` table
+    on an old database is missing some columns (e.g. `total_trades`),
+    the UPDATE only touches the columns that actually exist and the
+    trade is still recorded instead of crashing the whole close flow.
+    """
     conn = get_db_connection()
     cur = conn.cursor()
     try:
+        existing_cols = _get_existing_columns(conn, "statistics")
+
         cur.execute(f"SELECT * FROM statistics WHERE pair = {_ph()}", (pair,))
         stats = _fetchone(cur)
         if not stats:
             if USE_POSTGRES:
-                cur.execute("INSERT INTO statistics (pair) VALUES (%s) ON CONFLICT (pair) DO NOTHING", (pair,))
+                cur.execute(
+                    "INSERT INTO statistics (pair) VALUES (%s) ON CONFLICT (pair) DO NOTHING",
+                    (pair,),
+                )
             else:
                 cur.execute("INSERT OR IGNORE INTO statistics (pair) VALUES (?)", (pair,))
             conn.commit()
             cur.execute(f"SELECT * FROM statistics WHERE pair = {_ph()}", (pair,))
-            stats = _fetchone(cur)
+            stats = _fetchone(cur) or {}
 
-        total = int(stats.get("total_trades", 0)) + 1
-        wins = int(stats.get("wins", 0))
-        losses = int(stats.get("losses", 0))
-        draws = int(stats.get("draws", 0))
-        streak = int(stats.get("current_streak", 0))
-        best = int(stats.get("best_streak", 0))
-        worst = int(stats.get("worst_streak", 0))
+        def _g(key, default=0):
+            try:
+                return int(stats.get(key, default) or 0)
+            except (TypeError, ValueError):
+                return default
+
+        total  = _g("total_trades") + 1
+        wins   = _g("wins")
+        losses = _g("losses")
+        draws  = _g("draws")
+        streak = _g("current_streak")
+        best   = _g("best_streak")
+        worst  = _g("worst_streak")
 
         if result == "WIN":
             wins += 1
@@ -864,15 +911,39 @@ def update_statistics(pair, result):
 
         win_rate = round((wins / total) * 100, 2) if total else 0
 
+        # Build an UPDATE that only touches columns that really exist.
+        desired = [
+            ("total_trades",   total),
+            ("wins",           wins),
+            ("losses",         losses),
+            ("draws",          draws),
+            ("win_rate",       win_rate),
+            ("current_streak", streak),
+            ("best_streak",    best),
+            ("worst_streak",   worst),
+        ]
+        set_parts = []
+        values = []
+        for col, val in desired:
+            if col in existing_cols:
+                set_parts.append(f"{col} = {_ph()}")
+                values.append(val)
+
+        if "updated_at" in existing_cols:
+            set_parts.append("updated_at = CURRENT_TIMESTAMP")
+
+        if not set_parts:
+            logger.warning(
+                "statistics table has no updatable columns - skipping update for %s",
+                pair,
+            )
+            conn.rollback()
+            return
+
+        values.append(pair)
         cur.execute(
-            f"""
-            UPDATE statistics
-            SET total_trades = {_ph()}, wins = {_ph()}, losses = {_ph()}, draws = {_ph()},
-                win_rate = {_ph()}, current_streak = {_ph()}, best_streak = {_ph()},
-                worst_streak = {_ph()}, updated_at = CURRENT_TIMESTAMP
-            WHERE pair = {_ph()}
-            """,
-            (total, wins, losses, draws, win_rate, streak, best, worst, pair),
+            f"UPDATE statistics SET {', '.join(set_parts)} WHERE pair = {_ph()}",
+            tuple(values),
         )
         conn.commit()
     except Exception:
