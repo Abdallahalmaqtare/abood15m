@@ -1,15 +1,19 @@
 """
-Aboud Trading Bot - Signal Manager v5.3
-======================================
-Fixes:
-- Auto-correction of entry time when old PineScript sends +15 min offset
-- Wider acceptance window for entry timing (up to 35 min) with snap-down logic
-- Better error logging for DB schema issues
-- Restored compatibility with main.py / admin_bot.py
-- Accepts both pair/ticker and entry_time/target_entry_time payload formats
-- Uses current telegram_sender signatures correctly
-- Uses price_service API correctly for candle open/result
-- Supports signals_enabled setting and active trade state
+Aboud Trading Bot - Signal Manager v6.0 (TV-RESULT DELIVERY)
+============================================================
+What's new vs v5.3
+------------------
+- PRIMARY result source is now the TradingView `action=RESULT` webhook
+  (sent by Pine Script v6.1 on close of the entry candle). This contains
+  the real entry_price (candle open) and exit_price (candle close).
+- The bot waits for that webhook using an asyncio.Future, so the WIN/LOSS
+  message is delivered IMMEDIATELY when the candle closes.
+- External price APIs (TwelveData / Yahoo) are kept ONLY as a last-resort
+  fallback (used if TradingView webhook fails to arrive within the grace
+  window after expiry).
+- Duplicate RESULT webhooks for the same pair are ignored (idempotent).
+- Exactly 2 TradingView webhook calls per trade (SIGNAL + RESULT), so
+  TradingView is never overloaded.
 """
 
 import asyncio
@@ -41,6 +45,11 @@ from price_service import price_service as default_price_service
 
 logger = logging.getLogger(__name__)
 
+# How long to wait AFTER the entry candle is supposed to close before we give
+# up on TradingView and fall back to the external API. Keep this short —
+# TradingView normally fires the alert within 1-2 seconds of candle close.
+TV_RESULT_GRACE_SECONDS = 90
+
 
 class SignalManager:
     """Receives, validates, sends, and tracks trading signals."""
@@ -53,7 +62,13 @@ class SignalManager:
         self.active_trade_lock = asyncio.Lock()
         self._processing_lock = asyncio.Lock()
 
+        # pair (upper) -> asyncio.Future that resolves with TradingView's
+        # {entry_price, exit_price} when the RESULT webhook arrives.
+        self._result_futures = {}
+
+    # ─────────────────────────────────────────────────────────────
     # Compatibility alias expected by main.py
+    # ─────────────────────────────────────────────────────────────
     async def process_webhook_signal(self, data: dict) -> dict:
         return await self.handle_webhook(data)
 
@@ -64,13 +79,57 @@ class SignalManager:
             return {"status": "error", "message": "Invalid secret"}
 
         action = str(data.get("action", "SIGNAL")).upper()
+
         if action == "CANCEL":
             pair = data.get("ticker") or data.get("pair") or ""
             logger.info("🚫 Cancel signal ignored in immediate mode for %s", pair)
             return {"status": "ignored", "message": "Cancel ignored in immediate mode"}
 
+        # NEW: TradingView result webhook — deliver exit price straight from TV.
+        if action == "RESULT":
+            return await self._handle_tv_result(data)
+
         return await self.process_signal(data)
 
+    # ─────────────────────────────────────────────────────────────
+    # NEW: TradingView RESULT webhook handler
+    # ─────────────────────────────────────────────────────────────
+    async def _handle_tv_result(self, data: dict) -> dict:
+        pair = (data.get("ticker") or data.get("pair") or "").upper().replace("/", "")
+        if not pair:
+            return {"status": "rejected", "message": "Missing pair"}
+
+        try:
+            entry_price = float(data.get("entry_price"))
+            exit_price = float(data.get("exit_price"))
+        except (TypeError, ValueError):
+            logger.warning("RESULT webhook missing/bad prices: %s", data)
+            return {"status": "rejected", "message": "Bad prices"}
+
+        fut = self._result_futures.get(pair)
+        if fut and not fut.done():
+            fut.set_result({
+                "entry_price": entry_price,
+                "exit_price": exit_price,
+                "source": "tradingview",
+            })
+            logger.info(
+                "🎯 TV RESULT received for %s: entry=%s exit=%s — delivering to monitor",
+                pair, entry_price, exit_price,
+            )
+            return {"status": "accepted", "message": f"Result delivered for {pair}"}
+
+        # No active trade waiting — this is either a duplicate or a late signal.
+        # Ignore silently so TradingView doesn't retry.
+        logger.info(
+            "ℹ️  TV RESULT for %s ignored (no active trade waiting). entry=%s exit=%s",
+            pair, entry_price, exit_price,
+        )
+        return {"status": "ignored", "message": "No active trade"}
+
+    # ─────────────────────────────────────────────────────────────
+    # Main SIGNAL pipeline
+    # ─────────────────────────────────────────────────────────────
     async def process_signal(self, signal_data: dict) -> dict:
         async with self._processing_lock:
             pair = (signal_data.get("ticker") or signal_data.get("pair") or "").upper().replace("/", "")
@@ -136,7 +195,6 @@ class SignalManager:
 
             self.active_signals[pair] = datetime.now(timezone.utc)
 
-            # Build stats in the structure expected by messages.py/telegram_sender.py
             pair_stats = get_statistics(pair) or {}
             send_stats = {
                 "total_wins": int(pair_stats.get("total_wins", 0)),
@@ -171,6 +229,9 @@ class SignalManager:
                 "pending_id": pending_id,
             }
 
+    # ─────────────────────────────────────────────────────────────
+    # Trade monitor — waits for TV RESULT webhook (primary) or API (fallback)
+    # ─────────────────────────────────────────────────────────────
     async def _monitor_trade(self, pending_id, pair, direction, entry_time, signal_score=0):
         try:
             entry_dt = self._parse_entry_time(entry_time)
@@ -179,20 +240,24 @@ class SignalManager:
                 delete_pending_signal(pending_id)
                 return
 
+            # Register a future BEFORE we sleep, so a fast TV RESULT webhook
+            # that arrives while we're still waiting for the entry candle to
+            # open can still be delivered.
+            loop = asyncio.get_event_loop()
+            result_future = loop.create_future()
+            # If an old future is still hanging around for this pair, drop it.
+            old = self._result_futures.get(pair)
+            if old and not old.done():
+                old.cancel()
+            self._result_futures[pair] = result_future
+
+            # Wait until the entry candle opens.
             wait_seconds = (entry_dt - datetime.now(timezone.utc)).total_seconds()
             if wait_seconds > 0:
                 logger.info("⏳ Waiting %.1f seconds for entry %s %s", wait_seconds, pair, direction)
                 await asyncio.sleep(wait_seconds)
 
-            # let the new candle form
-            await asyncio.sleep(2)
-
-            candle = await self.price_service.get_trade_candle(pair, entry_dt)
-            if candle:
-                entry_price = candle.get("entry_price")
-            else:
-                entry_price = await self.price_service.get_price(pair)
-
+            # Create the trade row in DB (entry_price will be set when we learn it).
             expiry_dt = entry_dt + timedelta(minutes=TRADE_DURATION_MINUTES)
             expiry_time = expiry_dt.strftime("%Y-%m-%d %H:%M:%S")
 
@@ -208,10 +273,8 @@ class SignalManager:
             except Exception as e:
                 logger.exception("❌ Failed to create trade: %s", e)
                 delete_pending_signal(pending_id)
+                self._result_futures.pop(pair, None)
                 return
-
-            if entry_price is not None:
-                update_trade(trade_id, entry_price=entry_price)
 
             update_pending_signal(pending_id, "ACTIVE")
 
@@ -222,27 +285,70 @@ class SignalManager:
                     "direction": direction,
                     "entry_time": entry_time,
                     "expiry_time": expiry_time,
-                    "entry_price": entry_price,
+                    "entry_price": None,
                     "signal_score": signal_score,
                 }
 
-            remaining = (expiry_dt - datetime.now(timezone.utc)).total_seconds()
-            if remaining > 0:
-                logger.info("⏳ Trade active for %.1f seconds: #%s", remaining, trade_id)
-                await asyncio.sleep(remaining)
+            # ── Wait for RESULT ────────────────────────────────────────
+            # Primary path: TradingView sends action=RESULT at the close of
+            # the entry candle (~15 min from entry_dt). We wait until then
+            # plus a small grace period for the alert to reach us.
+            total_wait = (expiry_dt - datetime.now(timezone.utc)).total_seconds() + TV_RESULT_GRACE_SECONDS
+            if total_wait < 0:
+                total_wait = TV_RESULT_GRACE_SECONDS
 
-            # wait a few seconds for candle source to finalize close price
-            await asyncio.sleep(6)
+            entry_price = None
+            exit_price = None
+            source = "unknown"
 
-            result_candle = await self.price_service.get_trade_candle(pair, entry_dt)
-            exit_price = result_candle.get("exit_price") if result_candle else None
-            if exit_price is None:
-                exit_price = await self.price_service.get_price(pair)
+            try:
+                payload = await asyncio.wait_for(result_future, timeout=total_wait)
+                entry_price = payload.get("entry_price")
+                exit_price = payload.get("exit_price")
+                source = payload.get("source", "tradingview")
+                logger.info(
+                    "✅ Result from TradingView for %s: entry=%s exit=%s",
+                    pair, entry_price, exit_price,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "⚠️ TradingView RESULT webhook did not arrive for %s — "
+                    "falling back to external candle API",
+                    pair,
+                )
+                # Fallback: query TwelveData / Yahoo for the exact 15m candle.
+                candle = None
+                try:
+                    candle = await self.price_service.get_trade_candle(pair, entry_dt)
+                except Exception as e:
+                    logger.warning("Fallback candle fetch failed: %s", e)
+
+                if candle:
+                    entry_price = candle.get("entry_price")
+                    exit_price = candle.get("exit_price")
+                    source = candle.get("source", "api")
+                else:
+                    # Last resort: one spot quote. Result will likely be DRAW.
+                    try:
+                        exit_price = await self.price_service.get_price(pair)
+                        source = "spot-fallback"
+                    except Exception as e:
+                        logger.warning("Spot fallback failed: %s", e)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.exception("❌ Unexpected error waiting for RESULT: %s", e)
+            finally:
+                self._result_futures.pop(pair, None)
+
+            # Persist prices.
+            if entry_price is not None:
+                update_trade(trade_id, entry_price=entry_price)
 
             result = self._determine_result(direction, entry_price, exit_price)
             logger.info(
-                "📊 Trade completed: %s %s result=%s entry=%s exit=%s",
-                pair, direction, result, entry_price, exit_price,
+                "📊 Trade completed: %s %s result=%s entry=%s exit=%s source=%s",
+                pair, direction, result, entry_price, exit_price, source,
             )
 
             update_trade(
@@ -254,8 +360,10 @@ class SignalManager:
             update_statistics(pair, result)
             update_pending_signal(pending_id, "COMPLETED")
 
+            # ── SEND THE RESULT MESSAGE ────────────────────────────────
             try:
                 await self.telegram_sender.send_result(pair, direction, entry_time, result)
+                logger.info("📤 Telegram result sent: %s %s -> %s", pair, direction, result)
             except Exception as e:
                 logger.exception("❌ Telegram send_result failed: %s", e)
 
@@ -264,11 +372,64 @@ class SignalManager:
 
         except asyncio.CancelledError:
             logger.info("Trade monitor cancelled for %s", pair)
+            self._result_futures.pop(pair, None)
         except Exception as e:
             logger.exception("❌ Trade monitor error for %s: %s", pair, e)
+            self._result_futures.pop(pair, None)
             async with self.active_trade_lock:
                 self.active_trade = None
 
+    # ─────────────────────────────────────────────────────────────
+    # Recovery after restart (preserved from v6.1)
+    # ─────────────────────────────────────────────────────────────
+    async def recover_pending_trades(self) -> int:
+        """Re-spawn monitor tasks for trades that were ACTIVE before restart.
+
+        Render free-tier cycles the process frequently. Without this,
+        any trade that was mid-flight would never get its result message.
+        """
+        try:
+            from database import get_active_trades
+        except Exception as e:
+            logger.warning("recover: cannot import get_active_trades: %s", e)
+            return 0
+
+        try:
+            active = get_active_trades() or []
+        except Exception as e:
+            logger.warning("recover: get_active_trades failed: %s", e)
+            return 0
+
+        count = 0
+        now_utc = datetime.now(timezone.utc)
+        for t in active:
+            try:
+                entry_time = t.get("entry_time")
+                entry_dt = self._parse_entry_time(entry_time)
+                if not entry_dt:
+                    continue
+                expiry_dt = entry_dt + timedelta(minutes=TRADE_DURATION_MINUTES)
+                # If already way past expiry + grace, skip (can't recover reliably).
+                if (now_utc - expiry_dt).total_seconds() > 3600:
+                    continue
+
+                asyncio.create_task(
+                    self._monitor_trade(
+                        pending_id=0,
+                        pair=t.get("pair", ""),
+                        direction=t.get("direction", ""),
+                        entry_time=entry_time,
+                        signal_score=int(t.get("signal_score", 0) or 0),
+                    )
+                )
+                count += 1
+            except Exception as e:
+                logger.warning("recover: failed to resume trade %s: %s", t.get("id"), e)
+        return count
+
+    # ─────────────────────────────────────────────────────────────
+    # Helpers
+    # ─────────────────────────────────────────────────────────────
     def _determine_result(self, direction, entry_price, exit_price):
         if entry_price is None or exit_price is None:
             return "DRAW"
@@ -315,16 +476,13 @@ class SignalManager:
         diff = (entry_dt - now).total_seconds()
         minutes_until = diff / 60.0
 
-        # In immediate mode config is 0/0, so accept from ~now up to 16 minutes.
         min_seconds = SIGNAL_CONFIRM_MIN_SECONDS if SIGNAL_CONFIRM_MIN_SECONDS > 0 else -120
         max_seconds = SIGNAL_CONFIRM_MAX_SECONDS if SIGNAL_CONFIRM_MAX_SECONDS > 0 else 960
 
-        # Tier 1: in range
         if min_seconds <= diff <= max_seconds:
             normalized = entry_dt.strftime("%Y-%m-%d %H:%M:%S")
             return True, minutes_until, normalized
 
-        # Tier 2: old PineScript adds +15 min -> correct it
         if 16 * 60 < diff <= 40 * 60:
             corrected = entry_dt - timedelta(minutes=15)
             corrected_diff = (corrected - now).total_seconds()
@@ -336,7 +494,6 @@ class SignalManager:
                 )
                 return True, corrected_diff / 60.0, corrected.strftime("%Y-%m-%d %H:%M:%S")
 
-        # Tier 3: snap to the next 15-min boundary if within reasonable range
         if -2 * 60 <= diff <= 40 * 60:
             minute = (now.minute // 15 + 1) * 15
             if minute >= 60:
